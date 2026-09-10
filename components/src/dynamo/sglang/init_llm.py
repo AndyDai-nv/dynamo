@@ -153,6 +153,7 @@ async def init_decode(
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
+                initially_registered=not dynamo_args.defer_serving_registration,
             ),
             load_lora_endpoint.serve_endpoint(
                 handler.load_lora,
@@ -292,6 +293,7 @@ async def init_prefill(
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
+                initially_registered=not dynamo_args.defer_serving_registration,
             ),
             load_lora_endpoint.serve_endpoint(
                 handler.load_lora,

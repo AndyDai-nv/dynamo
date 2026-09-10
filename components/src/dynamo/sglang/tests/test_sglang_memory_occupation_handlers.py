@@ -64,9 +64,12 @@ def handler():
     handler.generate_endpoint = SimpleNamespace(
         unregister_endpoint_instance=AsyncMock(),
         register_endpoint_instance=AsyncMock(),
+        connection_id=MagicMock(return_value=0xA1),
     )
     handler._pause_controller = SGLangEnginePauseController(handler.engine)
     handler._pause_lock = asyncio.Lock()
+    handler._serving_enabled = True
+    handler._endpoint_registered = True
     return handler
 
 
@@ -100,6 +103,106 @@ async def test_release_and_resume_are_idempotent(handler):
 
     handler.engine.tokenizer_manager.resume_memory_occupation.assert_awaited_once()
     handler.engine.tokenizer_manager.continue_generation.assert_awaited_once()
+    handler.generate_endpoint.register_endpoint_instance.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_serving_membership_controls_are_idempotent(handler):
+    handler._serving_enabled = False
+    handler._endpoint_registered = False
+
+    first_enable = await handler.enable_serving({})
+    second_enable = await handler.enable_serving({})
+    first_disable = await handler.disable_serving({})
+    second_disable = await handler.disable_serving({})
+
+    assert first_enable == {
+        "status": "ok",
+        "message": "Serving enabled",
+        "changed": True,
+        "serving_enabled": True,
+        "endpoint_registered": True,
+        "connection_id": 0xA1,
+    }
+    assert second_enable["changed"] is False
+    assert first_disable["changed"] is True
+    assert second_disable["changed"] is False
+    assert second_disable["serving_enabled"] is False
+    assert second_disable["endpoint_registered"] is False
+    handler.generate_endpoint.register_endpoint_instance.assert_awaited_once()
+    handler.generate_endpoint.unregister_endpoint_instance.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_enable_serving_restores_intent_when_registration_fails(handler):
+    handler._serving_enabled = False
+    handler._endpoint_registered = False
+    handler.generate_endpoint.register_endpoint_instance = AsyncMock(
+        side_effect=RuntimeError("discovery write timeout")
+    )
+
+    result = await handler.enable_serving({})
+
+    assert result["status"] == "error"
+    assert result["changed"] is False
+    assert result["serving_enabled"] is False
+    assert result["endpoint_registered"] is False
+
+
+@pytest.mark.asyncio
+async def test_disable_serving_keeps_fail_closed_intent_and_can_retry(handler):
+    handler.generate_endpoint.unregister_endpoint_instance = AsyncMock(
+        side_effect=[RuntimeError("discovery write timeout"), None]
+    )
+
+    first_result = await handler.disable_serving({})
+    second_result = await handler.disable_serving({})
+
+    assert first_result["status"] == "error"
+    assert first_result["serving_enabled"] is False
+    assert first_result["endpoint_registered"] is True
+    assert second_result["status"] == "ok"
+    assert second_result["changed"] is True
+    assert second_result["endpoint_registered"] is False
+    assert handler.generate_endpoint.unregister_endpoint_instance.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_deferred_memory_cycle_stays_unregistered(handler):
+    handler._serving_enabled = False
+    handler._endpoint_registered = False
+
+    release_result = await handler.release_memory_occupation({})
+    resume_result = await handler.resume_memory_occupation({})
+
+    assert release_result["status"] == "ok"
+    assert resume_result["status"] == "ok"
+    assert handler._serving_enabled is False
+    assert handler._endpoint_registered is False
+    handler.generate_endpoint.unregister_endpoint_instance.assert_not_awaited()
+    handler.generate_endpoint.register_endpoint_instance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_deferred_worker_cannot_enable_serving_while_paused(handler):
+    handler._serving_enabled = False
+    handler._endpoint_registered = False
+    await handler.release_memory_occupation({})
+
+    paused_result = await handler.enable_serving({})
+
+    assert paused_result["status"] == "error"
+    assert paused_result["changed"] is False
+    assert handler._serving_enabled is False
+    assert handler._endpoint_registered is False
+
+    await handler.resume_memory_occupation({})
+    handler.generate_endpoint.register_endpoint_instance.assert_not_awaited()
+
+    enabled_result = await handler.enable_serving({})
+
+    assert enabled_result["status"] == "ok"
+    assert enabled_result["changed"] is True
     handler.generate_endpoint.register_endpoint_instance.assert_awaited_once()
 
 

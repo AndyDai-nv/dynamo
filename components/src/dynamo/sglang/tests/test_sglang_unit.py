@@ -340,6 +340,8 @@ def test_builtin_engine_routes_include_model_taint_update(monkeypatch):
     assert {path for path, _ in registered_routes} >= {
         "control/start_profile",
         "control/stop_profile",
+        "control/enable_serving",
+        "control/disable_serving",
     }
 
 
@@ -355,6 +357,7 @@ def _make_sglang_config(**overrides):
     config.image_diffusion_worker = False
     config.video_generation_worker = False
     config.enable_rl = False
+    config.defer_serving_registration = False
     config.frontend_decoding = False
     config.sglang_trace_level = 2
     config.fpm_trace = False
@@ -363,6 +366,27 @@ def _make_sglang_config(**overrides):
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
+
+
+@pytest.mark.parametrize(
+    "worker_flag",
+    [
+        "embedding_worker",
+        "enable_multimodal",
+        "image_diffusion_worker",
+        "video_generation_worker",
+    ],
+)
+def test_deferred_serving_registration_rejects_workers_without_control_routes(
+    worker_flag,
+):
+    config = _make_sglang_config(
+        defer_serving_registration=True,
+        **{worker_flag: True},
+    )
+
+    with pytest.raises(ValueError, match="only supported for LLM workers"):
+        config.validate()
 
 
 def test_compat_supports_tensor_image_sizes_and_is_idempotent(caplog, monkeypatch):

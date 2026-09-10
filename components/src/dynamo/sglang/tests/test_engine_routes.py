@@ -200,6 +200,23 @@ def test_repeated_cli_and_environment_configuration(monkeypatch):
     assert parse() == ["flush_cache", "update_weights_from_distributed:tm"]
 
 
+def test_deferred_serving_registration_cli_and_environment(monkeypatch):
+    if DynamoSGLangArgGroup is None:
+        pytest.skip("Dynamo runtime bindings are unavailable")
+
+    def parse(*args):
+        parser = argparse.ArgumentParser()
+        DynamoSGLangArgGroup().add_arguments(parser)
+        return parser.parse_args(args).defer_serving_registration
+
+    assert parse() is False
+    assert parse("--defer-serving-registration") is True
+    assert parse("--no-defer-serving-registration") is False
+
+    monkeypatch.setenv("DYN_SGL_DEFER_SERVING_REGISTRATION", "true")
+    assert parse() is True
+
+
 @pytest.mark.asyncio
 async def test_compatibility_routes_resolve_and_dispatch_without_a_registry():
     engine = FakeEngine(asyncio.get_running_loop())

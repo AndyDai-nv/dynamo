@@ -47,6 +47,7 @@ These arguments are added by Dynamo on top of SGLang's native arguments. For the
 | `--video-generation-worker` | `DYN_SGL_VIDEO_GENERATION_WORKER` | `false` | Run as [video generation](../../../../../use-cases/diffusion/workflows/text-to-video.md#sglang) worker |
 | `--disagg-config` | `DYN_SGL_DISAGG_CONFIG` | `None` | Path to YAML disaggregation config file |
 | `--disagg-config-key` | `DYN_SGL_DISAGG_CONFIG_KEY` | `None` | Key to select from disaggregation config (e.g., `prefill`, `decode`) |
+| `--defer-serving-registration` | `DYN_SGL_DEFER_SERVING_REGISTRATION` | `false` | Start the generate request plane and health checks without publishing the endpoint to discovery; use the serving control routes to change membership |
 | `--engine-route` | `DYN_SGLANG_ENGINE_ROUTES` | `None` | Expose a startup-allowlisted SGLang Engine or tokenizer-manager method under `/engine/<path>`; repeat the flag or separate environment descriptors with whitespace |
 
 > [!NOTE]
@@ -132,6 +133,8 @@ SGLang workers expose operational endpoints via Dynamo's system server:
 |-------|-------------|
 | `/engine/control/start_profile` | Start PyTorch profiling |
 | `/engine/control/stop_profile` | Stop profiling and save traces |
+| `/engine/control/enable_serving` | Publish this worker's generate endpoint to discovery; repeated calls are idempotent |
+| `/engine/control/disable_serving` | Withdraw this worker's generate endpoint from discovery; repeated calls are idempotent |
 | `/engine/control/release_memory_occupation` | Release GPU memory for maintenance |
 | `/engine/control/resume_memory_occupation` | Resume GPU memory after release |
 | `/engine/control/update_weights_from_disk` | Update model weights from disk |
@@ -139,6 +142,16 @@ SGLang workers expose operational endpoints via Dynamo's system server:
 | `/engine/control/update_weights_from_distributed` | Update model weights from distributed source |
 | `/engine/control/update_weights_from_ipc` | Update model weights from IPC payload |
 | `/engine/control/update_weight_version` | Update weight version metadata |
+
+Set `--defer-serving-registration` when an external controller must finish a weight update or
+another readiness gate before the worker receives inference requests. The request plane, health
+target, and control routes still start. The flag is rejected for embedding, multimodal, image
+diffusion, and video generation workers, which do not expose serving membership controls.
+
+Serving intent and memory occupation are separate states. Disabling serving does not release GPU
+memory. A worker that was serving before `release_memory_occupation` rejoins discovery after a
+successful `resume_memory_occupation`; a worker started with deferred registration remains outside
+discovery until `enable_serving` succeeds.
 
 ### Configurable SGLang Method Routes
 

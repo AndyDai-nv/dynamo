@@ -144,6 +144,17 @@ class DynamoSGLangArgGroup(ArgGroup):
             default=False,
             help="Enable RL metadata upload support.",
         )
+        add_negatable_bool_argument(
+            g,
+            flag_name="--defer-serving-registration",
+            env_var="DYN_SGL_DEFER_SERVING_REGISTRATION",
+            default=False,
+            help=(
+                "Start the generate request plane and health checks without "
+                "publishing the endpoint to discovery. An external controller "
+                "must enable serving through /engine/control/enable_serving."
+            ),
+        )
         add_argument(
             g,
             flag_name="--engine-route",
@@ -193,6 +204,7 @@ class DynamoSGLangConfig(ConfigBase):
 
     video_generation_worker: bool
     enable_rl: bool
+    defer_serving_registration: bool = False
     engine_routes: list[str]
     frontend_decoding: bool = False
     sglang_trace_level: int
@@ -217,6 +229,17 @@ class DynamoSGLangConfig(ConfigBase):
         self.validate_multimodal_topology()
 
         self.validate_dedicated_mm_encoder()
+
+        if self.defer_serving_registration and (
+            self.embedding_worker
+            or self.enable_multimodal
+            or self.image_diffusion_worker
+            or self.video_generation_worker
+        ):
+            raise ValueError(
+                "--defer-serving-registration is only supported for LLM workers "
+                "that expose serving membership control routes."
+            )
 
     def validate_dedicated_mm_encoder(self) -> None:
         if self.dedicated_mm_encoder and not self.enable_multimodal:

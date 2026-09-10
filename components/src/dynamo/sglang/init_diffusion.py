@@ -100,6 +100,7 @@ async def init_llm_diffusion(
                 graceful_shutdown=True,
                 metrics_labels=metrics_labels,
                 health_check_payload=health_check_payload,
+                initially_registered=not dynamo_args.defer_serving_registration,
             ),
             register_model_with_readiness_gate(
                 engine,

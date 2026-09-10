@@ -609,6 +609,8 @@ class BaseWorkerHandler(LoraMixin, BaseGenerativeHandler[RequestT, ResponseT]):
             SGLangEnginePauseController(engine) if engine is not None else None
         )
         self._pause_lock = asyncio.Lock()
+        self._serving_enabled = not config.dynamo_args.defer_serving_registration
+        self._endpoint_registered = self._serving_enabled
 
         # Serializes elastic-EP scaling: SGLang tracks a single in-flight scale
         # phase, so concurrent scale_elastic_ep calls must not overlap.
@@ -626,6 +628,92 @@ class BaseWorkerHandler(LoraMixin, BaseGenerativeHandler[RequestT, ResponseT]):
                 normalized = -normalized
             return {"priority": normalized}
         return {}
+
+    async def _set_endpoint_registered(self, registered: bool) -> bool:
+        """Make discovery membership match ``registered``.
+
+        The caller must hold ``_pause_lock`` so serving control and memory
+        pause/resume cannot race each other. Returns whether discovery changed.
+        """
+        if self.generate_endpoint is None:
+            raise RuntimeError("generate endpoint is unavailable")
+        if self._endpoint_registered == registered:
+            return False
+
+        if registered:
+            await self.generate_endpoint.register_endpoint_instance()
+        else:
+            await self.generate_endpoint.unregister_endpoint_instance()
+        self._endpoint_registered = registered
+        return True
+
+    def _serving_membership_response(
+        self, *, status: str, message: str, changed: bool
+    ) -> dict:
+        response = {
+            "status": status,
+            "message": message,
+            "changed": changed,
+            "serving_enabled": self._serving_enabled,
+            "endpoint_registered": self._endpoint_registered,
+        }
+        if self.generate_endpoint is not None:
+            response["connection_id"] = self.generate_endpoint.connection_id()
+        return response
+
+    async def enable_serving(self, _body: dict) -> dict:
+        """Allow this worker to receive new requests through discovery."""
+        async with self._pause_lock:
+            previous_intent = self._serving_enabled
+            self._serving_enabled = True
+
+            if self._pause_controller is not None and (
+                self._pause_controller.is_paused
+                or self._pause_controller.needs_resume_recovery
+            ):
+                self._serving_enabled = previous_intent
+                return self._serving_membership_response(
+                    status="error",
+                    message="Cannot enable serving while memory is paused",
+                    changed=False,
+                )
+
+            try:
+                changed = await self._set_endpoint_registered(True)
+            except Exception as error:
+                self._serving_enabled = previous_intent
+                logger.error("Failed to enable serving: %s", error)
+                return self._serving_membership_response(
+                    status="error",
+                    message=str(error),
+                    changed=False,
+                )
+
+            return self._serving_membership_response(
+                status="ok",
+                message="Serving enabled",
+                changed=changed,
+            )
+
+    async def disable_serving(self, _body: dict) -> dict:
+        """Stop new requests by withdrawing this worker from discovery."""
+        async with self._pause_lock:
+            self._serving_enabled = False
+            try:
+                changed = await self._set_endpoint_registered(False)
+            except Exception as error:
+                logger.error("Failed to disable serving: %s", error)
+                return self._serving_membership_response(
+                    status="error",
+                    message=str(error),
+                    changed=False,
+                )
+
+            return self._serving_membership_response(
+                status="ok",
+                message="Serving disabled",
+                changed=changed,
+            )
 
     async def release_memory_occupation(self, body: dict) -> dict:
         """Release GPU memory occupation and unregister from discovery.
@@ -662,8 +750,7 @@ class BaseWorkerHandler(LoraMixin, BaseGenerativeHandler[RequestT, ResponseT]):
             try:
                 # Stop new requests and drain in-flight work before releasing memory.
                 if self.generate_endpoint is not None:
-                    await self.generate_endpoint.unregister_endpoint_instance()
-                    unregistered = True
+                    unregistered = await self._set_endpoint_registered(False)
 
                 await self._pause_controller.pause(tags)
 
@@ -682,12 +769,13 @@ class BaseWorkerHandler(LoraMixin, BaseGenerativeHandler[RequestT, ResponseT]):
                 # early-return. Re-register so the worker rejoins the routing pool.
                 if (
                     unregistered
+                    and self._serving_enabled
                     and not self._pause_controller.is_paused
                     and not self._pause_controller.needs_resume_recovery
                     and self.generate_endpoint is not None
                 ):
                     try:
-                        await self.generate_endpoint.register_endpoint_instance()
+                        await self._set_endpoint_registered(True)
                         logging.info(
                             "Re-registered endpoint after failed memory release rollback"
                         )
@@ -727,8 +815,8 @@ class BaseWorkerHandler(LoraMixin, BaseGenerativeHandler[RequestT, ResponseT]):
             try:
                 await self._pause_controller.resume(tags)
 
-                if self.generate_endpoint is not None:
-                    await self.generate_endpoint.register_endpoint_instance()
+                if self._serving_enabled and self.generate_endpoint is not None:
+                    await self._set_endpoint_registered(True)
                 self._pause_controller.mark_resumed()
 
                 return {
@@ -989,6 +1077,8 @@ class BaseWorkerHandler(LoraMixin, BaseGenerativeHandler[RequestT, ResponseT]):
         built_in_routes = {
             "control/start_profile": self.start_profile,
             "control/stop_profile": self.stop_profile,
+            "control/enable_serving": self.enable_serving,
+            "control/disable_serving": self.disable_serving,
             "control/release_memory_occupation": self.release_memory_occupation,
             "control/resume_memory_occupation": self.resume_memory_occupation,
             "control/update_weights_from_disk": self.update_weights_from_disk,
