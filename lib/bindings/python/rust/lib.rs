@@ -1475,7 +1475,7 @@ impl Endpoint {
         })
     }
 
-    #[pyo3(signature = (generator, graceful_shutdown = true, metrics_labels = None, health_check_payload = None))]
+    #[pyo3(signature = (generator, graceful_shutdown = true, metrics_labels = None, health_check_payload = None, initially_registered = true))]
     fn serve_endpoint<'p>(
         &self,
         py: Python<'p>,
@@ -1483,6 +1483,7 @@ impl Endpoint {
         graceful_shutdown: Option<bool>,
         metrics_labels: Option<Vec<(String, String)>>,
         health_check_payload: Option<&Bound<'p, PyDict>>,
+        initially_registered: Option<bool>,
     ) -> PyResult<Bound<'p, PyAny>> {
         // Push egress: the handler pushes each response into a Rust channel via
         // its `response_sender` argument, instead of Rust pulling `__anext__`
@@ -1588,9 +1589,11 @@ impl Endpoint {
         }
 
         let graceful_shutdown = graceful_shutdown.unwrap_or(true);
+        let initially_registered = initially_registered.unwrap_or(true);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             builder
                 .graceful_shutdown(graceful_shutdown)
+                .initially_registered(initially_registered)
                 .start()
                 .await
                 .map_err(to_pyerr)?;

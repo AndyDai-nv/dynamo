@@ -152,7 +152,7 @@ class Endpoint:
 
     async def first_token_source(self, worker_type: WorkerType) -> Optional[FirstTokenSource]: ...
 
-    async def serve_endpoint(self, handler: RequestHandler, graceful_shutdown: bool = True, metrics_labels: Optional[List[Tuple[str, str]]] = None, health_check_payload: Optional[Dict[str, Any]] = None) -> None:
+    async def serve_endpoint(self, handler: RequestHandler, graceful_shutdown: bool = True, metrics_labels: Optional[List[Tuple[str, str]]] = None, health_check_payload: Optional[Dict[str, Any]] = None, initially_registered: bool = True) -> None:
         """
         Serve an endpoint discoverable by all connected clients at
         `{{ namespace }}/components/{{ component_name }}/endpoints/{{ endpoint_name }}`
@@ -163,6 +163,10 @@ class Endpoint:
             metrics_labels: Optional list of metrics labels to add to the metrics
             health_check_payload: Optional dict containing the health check request payload
                                   that will be used to verify endpoint health
+            initially_registered: Whether to publish this endpoint instance to discovery
+                                  during startup. When False, the request plane and health
+                                  target still start, and register_endpoint_instance() can
+                                  publish the endpoint later.
         """
         ...
 
