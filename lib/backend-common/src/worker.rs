@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::adapter::{EngineAdapter, RawEngineAdapter};
 use crate::disagg::DisaggregationMode;
 use crate::engine::{
-    EngineConfig, KvEventSource, LLMEngine, MetricsBindings, MetricsCtx, RawEngine,
+    EngineConfig, KvEventSource, LLMEngine, MetricsBindings, MetricsCtx, RawEngine, ServingFence,
 };
 use crate::error::{BackendError, DynamoError, ErrorType};
 use crate::publisher::{PublisherHandles, setup_publishers};
@@ -66,6 +66,10 @@ const HEALTH_CHECK_PAYLOAD_ENV: &str = "DYN_HEALTH_CHECK_PAYLOAD";
 /// Runtime-system route for replacing this worker's caller-managed model taints.
 const MODEL_TAINT_UPDATE_NAME: &str = "model_taints";
 const MODEL_TAINT_UPDATE_ROUTE: &str = "update/model_taints";
+
+const SERVING_ENABLE_ROUTE: &str = "serving/enable";
+const SERVING_DISABLE_ROUTE: &str = "serving/disable";
+const SERVING_STATUS_ROUTE: &str = "serving/status";
 
 /// Per-worker transport configuration. Explicit values take precedence over
 /// environment defaults when the worker constructs its distributed runtime.
@@ -195,6 +199,10 @@ pub struct WorkerConfig {
     pub media_fetcher: Option<MediaFetcher>,
     /// Deployment-level default thinking mode written to runtime metadata.
     pub default_thinking_mode: Option<String>,
+    /// Start the request handler without publishing the serving endpoint to discovery.
+    pub defer_serving: bool,
+    /// Require an exact weight-version fence on every serving enable operation.
+    pub require_weight_version_fence: bool,
 }
 
 impl WorkerConfig {
@@ -238,6 +246,8 @@ impl Default for WorkerConfig {
             media_decoder: None,
             media_fetcher: None,
             default_thinking_mode: None,
+            defer_serving: false,
+            require_weight_version_fence: false,
         }
     }
 }
@@ -387,6 +397,22 @@ impl EngineKind {
         }
     }
 
+    async fn validate_serving_fence(
+        &self,
+        expected: ServingFence,
+    ) -> Result<ServingFence, DynamoError> {
+        match self {
+            EngineKind::Llm(e) => e.validate_serving_fence(expected).await,
+            EngineKind::Raw(_) if expected == ServingFence::default() => {
+                Ok(ServingFence::default())
+            }
+            EngineKind::Raw(_) => Err(err(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                "raw engines do not support serving fences",
+            )),
+        }
+    }
+
     /// Raw media engines (image/video/audio) register name-only — the engine
     /// loads the model itself and the model has no LLM artifacts (tokenizer /
     /// chat template / config.json) for Dynamo to fetch.
@@ -490,6 +516,7 @@ impl Worker {
         // a listener task just to get an InvalidArgument error.
         validate_model_input(self.config.model_input, &self.engine)?;
         validate_route_to_encoder(&self.config)?;
+        validate_serving_config(&self.config)?;
 
         // Install the OS signal handlers synchronously, before spawning
         // anything, so a SIGTERM delivered between this point and the
@@ -763,6 +790,7 @@ impl Worker {
     async fn register_engine_controls(
         &self,
         endpoint: &dynamo_runtime::component::Endpoint,
+        serving_registration: Option<SharedServingRegistration>,
     ) -> Result<(), DynamoError> {
         let controls = self.engine.supported_controls().await?;
         if controls.is_empty() {
@@ -779,9 +807,12 @@ impl Worker {
                 callback,
                 self.engine.clone(),
                 endpoint.clone(),
-                self.engine_route_lifecycle.clone(),
-                self.engine_route_mutation.clone(),
-                self.engine_route_shutdown.clone(),
+                EngineControlCoordination {
+                    lifecycle: self.engine_route_lifecycle.clone(),
+                    mutation: self.engine_route_mutation.clone(),
+                    shutdown: self.engine_route_shutdown.clone(),
+                    serving_registration: serving_registration.clone(),
+                },
             );
             // Namespace control routes under `/engine/control/<name>` so they
             // share the `/engine/{*path}` route without colliding with updates.
@@ -854,6 +885,45 @@ impl Worker {
             MODEL_TAINT_UPDATE_ROUTE,
             model_taint_update_callback(
                 endpoint.clone(),
+                self.engine_route_lifecycle.clone(),
+                self.engine_route_shutdown.clone(),
+            ),
+        );
+    }
+
+    fn register_serving_routes(
+        &self,
+        endpoint: &dynamo_runtime::component::Endpoint,
+        state: SharedServingRegistration,
+    ) {
+        let registry = endpoint.drt().engine_routes();
+        registry.register(
+            SERVING_ENABLE_ROUTE,
+            serving_enable_callback(
+                self.engine.clone(),
+                endpoint.clone(),
+                state.clone(),
+                self.config.require_weight_version_fence,
+                self.engine_route_lifecycle.clone(),
+                self.engine_route_mutation.clone(),
+                self.engine_route_shutdown.clone(),
+            ),
+        );
+        registry.register(
+            SERVING_DISABLE_ROUTE,
+            serving_disable_callback(
+                endpoint.clone(),
+                state.clone(),
+                self.engine_route_lifecycle.clone(),
+                self.engine_route_mutation.clone(),
+                self.engine_route_shutdown.clone(),
+            ),
+        );
+        registry.register(
+            SERVING_STATUS_ROUTE,
+            serving_status_callback(
+                state,
+                self.config.require_weight_version_fence,
                 self.engine_route_lifecycle.clone(),
                 self.engine_route_shutdown.clone(),
             ),
@@ -988,9 +1058,27 @@ impl Worker {
             })?;
         tracing::debug!("model registered with discovery");
 
-        self.register_engine_controls(&endpoint).await?;
+        // Take the readiness hold before any serving endpoint registration and
+        // share it with every route that can change discovery membership.
+        let mut readiness_hold = Some(ReadinessHold::take(
+            endpoint.drt().system_health(),
+            endpoint.name(),
+        ));
+        let serving_registration = self.config.defer_serving.then(|| {
+            Arc::new(tokio::sync::Mutex::new(ServingRegistrationState {
+                registered: false,
+                readiness_hold: readiness_hold.take(),
+                observed_weight_version: None,
+            }))
+        });
+
+        self.register_engine_controls(&endpoint, serving_registration.clone())
+            .await?;
         self.register_engine_updates(&endpoint).await?;
         self.register_model_taint_update_route(&endpoint);
+        if let Some(state) = serving_registration.clone() {
+            self.register_serving_routes(&endpoint, state);
+        }
 
         let served = resolve_served_name(&self.config, engine_config)
             .unwrap_or_else(|| engine_config.model.clone());
@@ -1085,7 +1173,8 @@ impl Worker {
             .endpoint_builder()
             .handler(ingress)
             .metrics_labels(metrics_labels)
-            .graceful_shutdown(true);
+            .graceful_shutdown(true)
+            .initially_registered(!self.config.defer_serving);
         if let Some(payload) = probe {
             builder = builder.health_check_payload(payload);
             // The runtime's `HealthCheckManager` fires the canary by looking
@@ -1099,12 +1188,6 @@ impl Worker {
                 )
             })?;
         }
-        // Readiness is this worker's to publish: it is not serviceable until every
-        // mandatory endpoint is registered and the engine routes are open. The
-        // hold suppresses the whole process's readiness, so covering the primary
-        // endpoint also covers the RL endpoint registered further down.
-        let readiness_hold = ReadinessHold::take(endpoint.drt().system_health(), endpoint.name());
-
         let start_fut = builder.start_with_registration();
         tokio::pin!(start_fut);
         let primary_endpoint = tokio::select! {
@@ -1140,8 +1223,21 @@ impl Worker {
             return Ok(());
         }
 
+        if self.config.defer_serving {
+            // Publish the initial state before opening administrative routes.
+            // Otherwise a fast enable could set Ready here and then have a later
+            // startup write overwrite it back to NotReady.
+            set_worker_health(&endpoint, HealthStatus::NotReady);
+            tracing::info!(
+                endpoint = %endpoint.id(),
+                require_weight_version_fence = self.config.require_weight_version_fence,
+                "Serving discovery registration deferred"
+            );
+        }
+
         // Administrative routes are registered above, but remain gated until
-        // the exact primary discovery instance is callable.
+        // the primary request-plane instance is callable. A deferred endpoint
+        // is intentionally absent from discovery at this point.
         self.activate_engine_routes().await;
 
         let rl_endpoint = if let Some(rl_config) = rl_config {
@@ -1185,13 +1281,15 @@ impl Worker {
             return Ok(());
         }
 
-        // First instant the worker is serviceable: every mandatory endpoint is
-        // registered, the token is uncancelled, and engine routes are open. The
-        // hold taken before registration is what kept the runtime from reporting
-        // ready before this point; drop it here, because the write below
-        // publishes readiness through the very signal it suppresses.
-        drop(readiness_hold);
-        set_worker_health(&endpoint, HealthStatus::Ready);
+        if !self.config.defer_serving {
+            // First instant the worker is serviceable: every mandatory endpoint is
+            // registered, the token is uncancelled, and engine routes are open. The
+            // hold taken before registration is what kept the runtime from reporting
+            // ready before this point; drop it here, because the write below
+            // publishes readiness through the very signal it suppresses.
+            drop(readiness_hold.take());
+            set_worker_health(&endpoint, HealthStatus::Ready);
+        }
 
         let serve_fut = primary_endpoint.wait();
         tokio::pin!(serve_fut);
@@ -1690,6 +1788,249 @@ fn model_taint_update_callback(
     })
 }
 
+struct ServingRegistrationState {
+    registered: bool,
+    readiness_hold: Option<ReadinessHold>,
+    observed_weight_version: Option<String>,
+}
+
+type SharedServingRegistration = Arc<tokio::sync::Mutex<ServingRegistrationState>>;
+
+fn serving_response(
+    registered: bool,
+    changed: bool,
+    observed_weight_version: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ok",
+        "serving": registered,
+        "changed": changed,
+        "observed_weight_version": observed_weight_version,
+    })
+}
+
+fn serving_enable_request(
+    body: &serde_json::Value,
+    require_weight_version_fence: bool,
+) -> Result<ServingFence, serde_json::Value> {
+    let Some(object) = body.as_object() else {
+        return Err(control_error_response(
+            "serving enable request body must be a JSON object",
+        ));
+    };
+    let expected_weight_version = match object.get("expected_weight_version") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(version)) if !version.trim().is_empty() => {
+            Some(version.clone())
+        }
+        Some(serde_json::Value::String(_)) => {
+            return Err(control_error_response(
+                "expected_weight_version must not be empty",
+            ));
+        }
+        Some(_) => {
+            return Err(control_error_response(
+                "expected_weight_version must be a string",
+            ));
+        }
+    };
+    if require_weight_version_fence && expected_weight_version.is_none() {
+        return Err(control_error_response(
+            "expected_weight_version is required by this worker",
+        ));
+    }
+    Ok(ServingFence {
+        weight_version: expected_weight_version,
+    })
+}
+
+async fn withdraw_serving(
+    endpoint: &dynamo_runtime::component::Endpoint,
+    state: &mut ServingRegistrationState,
+) -> anyhow::Result<bool> {
+    if !state.registered {
+        return Ok(false);
+    }
+    if state.readiness_hold.is_none() {
+        state.readiness_hold = Some(ReadinessHold::take(
+            endpoint.drt().system_health(),
+            endpoint.name(),
+        ));
+    }
+    set_worker_health(endpoint, HealthStatus::NotReady);
+    endpoint.unregister_endpoint_instance().await?;
+    state.registered = false;
+    Ok(true)
+}
+
+fn serving_disable_callback(
+    endpoint: dynamo_runtime::component::Endpoint,
+    state: SharedServingRegistration,
+    route_lifecycle: Arc<tokio::sync::RwLock<EngineRouteLifecycle>>,
+    route_mutation: Arc<tokio::sync::Mutex<()>>,
+    route_shutdown: CancellationToken,
+) -> EngineRouteCallback {
+    Arc::new(move |body| {
+        let endpoint = endpoint.clone();
+        let state = state.clone();
+        let route_lifecycle = route_lifecycle.clone();
+        let route_mutation = route_mutation.clone();
+        let route_shutdown = route_shutdown.clone();
+        Box::pin(async move {
+            if !body.is_object() {
+                return Ok(control_error_response(
+                    "serving disable request body must be a JSON object",
+                ));
+            }
+            let _mutation = tokio::select! {
+                biased;
+                _ = route_shutdown.cancelled() => {
+                    return Ok(engine_route_lifecycle_error(EngineRouteLifecycle::ShuttingDown));
+                }
+                mutation = route_mutation.lock() => mutation,
+            };
+            let _lifecycle =
+                match acquire_engine_route_guard(route_lifecycle, &route_shutdown).await {
+                    Ok(lifecycle) => lifecycle,
+                    Err(response) => return Ok(response),
+                };
+            let mut state = state.lock().await;
+            let changed = match withdraw_serving(&endpoint, &mut state).await {
+                Ok(changed) => changed,
+                Err(error) => {
+                    return Ok(control_error_response(format!(
+                        "failed to disable serving: {error}"
+                    )));
+                }
+            };
+            Ok(serving_response(
+                state.registered,
+                changed,
+                state.observed_weight_version.as_deref(),
+            ))
+        })
+    })
+}
+
+fn serving_enable_callback(
+    engine: EngineKind,
+    endpoint: dynamo_runtime::component::Endpoint,
+    state: SharedServingRegistration,
+    require_weight_version_fence: bool,
+    route_lifecycle: Arc<tokio::sync::RwLock<EngineRouteLifecycle>>,
+    route_mutation: Arc<tokio::sync::Mutex<()>>,
+    route_shutdown: CancellationToken,
+) -> EngineRouteCallback {
+    Arc::new(move |body| {
+        let engine = engine.clone();
+        let endpoint = endpoint.clone();
+        let state = state.clone();
+        let route_lifecycle = route_lifecycle.clone();
+        let route_mutation = route_mutation.clone();
+        let route_shutdown = route_shutdown.clone();
+        Box::pin(async move {
+            let expected = match serving_enable_request(&body, require_weight_version_fence) {
+                Ok(expected) => expected,
+                Err(response) => return Ok(response),
+            };
+            let _mutation = tokio::select! {
+                biased;
+                _ = route_shutdown.cancelled() => {
+                    return Ok(engine_route_lifecycle_error(EngineRouteLifecycle::ShuttingDown));
+                }
+                mutation = route_mutation.lock() => mutation,
+            };
+            let _lifecycle =
+                match acquire_engine_route_guard(route_lifecycle, &route_shutdown).await {
+                    Ok(lifecycle) => lifecycle,
+                    Err(response) => return Ok(response),
+                };
+
+            let observed = tokio::select! {
+                biased;
+                _ = route_shutdown.cancelled() => {
+                    return Ok(engine_route_lifecycle_error(EngineRouteLifecycle::ShuttingDown));
+                }
+                result = engine.validate_serving_fence(expected) => result,
+            };
+            let observed = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    let mut state = state.lock().await;
+                    if let Err(withdraw_error) = withdraw_serving(&endpoint, &mut state).await {
+                        return Ok(control_error_response(format!(
+                            "serving fence failed: {error}; additionally failed to withdraw endpoint: {withdraw_error}"
+                        )));
+                    }
+                    return Ok(control_error_response(format!(
+                        "serving fence failed: {error}"
+                    )));
+                }
+            };
+
+            let mut state = state.lock().await;
+            state.observed_weight_version = observed.weight_version;
+            if state.registered {
+                return Ok(serving_response(
+                    true,
+                    false,
+                    state.observed_weight_version.as_deref(),
+                ));
+            }
+            let register_result = tokio::select! {
+                biased;
+                _ = route_shutdown.cancelled() => {
+                    return Ok(engine_route_lifecycle_error(EngineRouteLifecycle::ShuttingDown));
+                }
+                result = endpoint.register_endpoint_instance() => result,
+            };
+            if let Err(error) = register_result {
+                return Ok(control_error_response(format!(
+                    "serving fence passed but discovery registration failed: {error}; retry is safe"
+                )));
+            }
+            state.registered = true;
+            let readiness_hold = state.readiness_hold.take();
+            let observed_weight_version = state.observed_weight_version.clone();
+            drop(state);
+            drop(readiness_hold);
+            set_worker_health(&endpoint, HealthStatus::Ready);
+            Ok(serving_response(
+                true,
+                true,
+                observed_weight_version.as_deref(),
+            ))
+        })
+    })
+}
+
+fn serving_status_callback(
+    state: SharedServingRegistration,
+    require_weight_version_fence: bool,
+    route_lifecycle: Arc<tokio::sync::RwLock<EngineRouteLifecycle>>,
+    route_shutdown: CancellationToken,
+) -> EngineRouteCallback {
+    Arc::new(move |_body| {
+        let state = state.clone();
+        let route_lifecycle = route_lifecycle.clone();
+        let route_shutdown = route_shutdown.clone();
+        Box::pin(async move {
+            let _lifecycle =
+                match acquire_engine_route_guard(route_lifecycle, &route_shutdown).await {
+                    Ok(lifecycle) => lifecycle,
+                    Err(response) => return Ok(response),
+                };
+            let state = state.lock().await;
+            Ok(serde_json::json!({
+                "status": "ok",
+                "serving": state.registered,
+                "require_weight_version_fence": require_weight_version_fence,
+                "observed_weight_version": state.observed_weight_version,
+            }))
+        })
+    })
+}
+
 fn engine_control_callback(control_name: String, engine: EngineKind) -> EngineRouteCallback {
     Arc::new(move |body| {
         let engine = engine.clone();
@@ -1736,14 +2077,20 @@ fn engine_update_callback(
     })
 }
 
+#[derive(Clone)]
+struct EngineControlCoordination {
+    lifecycle: Arc<tokio::sync::RwLock<EngineRouteLifecycle>>,
+    mutation: Arc<tokio::sync::Mutex<()>>,
+    shutdown: CancellationToken,
+    serving_registration: Option<SharedServingRegistration>,
+}
+
 fn wrap_engine_control_callback(
     control_name: String,
     callback: EngineRouteCallback,
     engine: EngineKind,
     endpoint: dynamo_runtime::component::Endpoint,
-    route_lifecycle: Arc<tokio::sync::RwLock<EngineRouteLifecycle>>,
-    route_mutation: Arc<tokio::sync::Mutex<()>>,
-    route_shutdown: CancellationToken,
+    coordination: EngineControlCoordination,
 ) -> EngineRouteCallback {
     let policy = engine_control_policy(&control_name);
     Arc::new(move |body| {
@@ -1751,9 +2098,10 @@ fn wrap_engine_control_callback(
         let engine = engine.clone();
         let endpoint = endpoint.clone();
         let control_name = control_name.clone();
-        let route_lifecycle = route_lifecycle.clone();
-        let route_mutation = route_mutation.clone();
-        let route_shutdown = route_shutdown.clone();
+        let route_lifecycle = coordination.lifecycle.clone();
+        let route_mutation = coordination.mutation.clone();
+        let route_shutdown = coordination.shutdown.clone();
+        let serving_registration = coordination.serving_registration.clone();
         Box::pin(async move {
             if let Some(response) = control_request_body_error(&body) {
                 return Ok(response);
@@ -1790,17 +2138,26 @@ fn wrap_engine_control_callback(
                             Ok(lifecycle) => lifecycle,
                             Err(response) => return Ok(response),
                         };
-                    let unregister_result = tokio::select! {
-                        biased;
-                        _ = route_shutdown.cancelled() => {
-                            return Ok(engine_route_lifecycle_error(EngineRouteLifecycle::ShuttingDown));
+                    if let Some(state) = &serving_registration {
+                        let mut state = state.lock().await;
+                        if let Err(e) = withdraw_serving(&endpoint, &mut state).await {
+                            return Ok(control_error_response(format!(
+                                "failed to unregister endpoint before /engine/control/{control_name}: {e}"
+                            )));
                         }
-                        result = endpoint.unregister_endpoint_instance() => result,
-                    };
-                    if let Err(e) = unregister_result {
-                        return Ok(control_error_response(format!(
-                            "failed to unregister endpoint before /engine/control/{control_name}: {e}"
-                        )));
+                    } else {
+                        let unregister_result = tokio::select! {
+                            biased;
+                            _ = route_shutdown.cancelled() => {
+                                return Ok(engine_route_lifecycle_error(EngineRouteLifecycle::ShuttingDown));
+                            }
+                            result = endpoint.unregister_endpoint_instance() => result,
+                        };
+                        if let Err(e) = unregister_result {
+                            return Ok(control_error_response(format!(
+                                "failed to unregister endpoint before /engine/control/{control_name}: {e}"
+                            )));
+                        }
                     }
                     // Out of discovery, so no longer routable. Whether the
                     // control itself then succeeds or fails, the endpoint is
@@ -1848,6 +2205,19 @@ fn wrap_engine_control_callback(
                             Ok(lifecycle) => lifecycle,
                             Err(response) => return Ok(response),
                         };
+                    if let Some(state) = &serving_registration {
+                        // Deferred workers have one admission path. Even if a
+                        // resume/wake control is invoked while still published,
+                        // withdraw it before mutating engine state; successful
+                        // completion must be followed by a separately fenced
+                        // /engine/serving/enable call.
+                        let mut state = state.lock().await;
+                        if let Err(e) = withdraw_serving(&endpoint, &mut state).await {
+                            return Ok(control_error_response(format!(
+                                "failed to unregister endpoint before /engine/control/{control_name}: {e}"
+                            )));
+                        }
+                    }
                     let response = tokio::select! {
                         biased;
                         _ = route_shutdown.cancelled() => {
@@ -1862,6 +2232,13 @@ fn wrap_engine_control_callback(
                                 "engine control completed but the engine is not serving-ready; leaving endpoint unregistered"
                             );
                         }
+                        return Ok(response);
+                    }
+                    if serving_registration.is_some() {
+                        tracing::info!(
+                            control = %control_name,
+                            "engine control completed; deferred worker remains out of discovery until fenced serving enable"
+                        );
                         return Ok(response);
                     }
                     let register_result = tokio::select! {
@@ -1997,6 +2374,16 @@ fn validate_route_to_encoder(config: &WorkerConfig) -> Result<(), DynamoError> {
             ),
         )),
     }
+}
+
+fn validate_serving_config(config: &WorkerConfig) -> Result<(), DynamoError> {
+    if config.require_weight_version_fence && !config.defer_serving {
+        return Err(err(
+            ErrorType::Backend(BackendError::InvalidArgument),
+            "require_weight_version_fence=true requires defer_serving=true so initial discovery registration cannot bypass the fence",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_endpoint_types(s: &str) -> Result<ModelType, DynamoError> {
@@ -3650,6 +4037,237 @@ mod handoff_and_lifecycle_tests {
         }
     }
 
+    struct ServingFenceMockEngine {
+        weight_version: Arc<StdMutex<String>>,
+    }
+
+    impl ServingFenceMockEngine {
+        fn new(weight_version: &str) -> (Arc<Self>, Arc<StdMutex<String>>) {
+            let weight_version = Arc::new(StdMutex::new(weight_version.to_string()));
+            (
+                Arc::new(Self {
+                    weight_version: weight_version.clone(),
+                }),
+                weight_version,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl LLMEngine for ServingFenceMockEngine {
+        async fn start(&self, _worker_id: u64) -> Result<EngineConfig, DynamoError> {
+            Ok(EngineConfig::default())
+        }
+
+        async fn generate(
+            &self,
+            _request: PreprocessedRequest,
+            _ctx: crate::engine::GenerateContext,
+        ) -> Result<
+            BoxStream<'static, Result<crate::engine::LLMEngineOutput, DynamoError>>,
+            DynamoError,
+        > {
+            unreachable!("not used in serving-fence tests")
+        }
+
+        async fn cleanup(&self) -> Result<(), DynamoError> {
+            Ok(())
+        }
+
+        async fn validate_serving_fence(
+            &self,
+            expected: ServingFence,
+        ) -> Result<ServingFence, DynamoError> {
+            let observed = self.weight_version.lock().unwrap().clone();
+            if expected
+                .weight_version
+                .as_deref()
+                .is_some_and(|version| version != observed)
+            {
+                return Err(err(
+                    ErrorType::Backend(BackendError::InvalidArgument),
+                    format!(
+                        "weight-version serving fence mismatch: expected {:?}, observed {observed}",
+                        expected.weight_version
+                    ),
+                ));
+            }
+            Ok(ServingFence {
+                weight_version: Some(observed),
+            })
+        }
+    }
+
+    async fn discovered_endpoint_count(endpoint: &dynamo_runtime::component::Endpoint) -> usize {
+        let endpoint_id = endpoint.id();
+        endpoint
+            .drt()
+            .discovery()
+            .list(DiscoveryQuery::Endpoint {
+                namespace: endpoint_id.namespace,
+                component: endpoint_id.component,
+                endpoint: endpoint_id.name,
+            })
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn serving_membership_is_idempotent_and_weight_fenced() {
+        let endpoint = test_local_endpoint().await;
+        let (engine, weight_version) = ServingFenceMockEngine::new("v1");
+        let config = WorkerConfig {
+            defer_serving: true,
+            require_weight_version_fence: true,
+            ..WorkerConfig::default()
+        };
+        let worker = Worker::new(engine, config);
+        let state = Arc::new(tokio::sync::Mutex::new(ServingRegistrationState {
+            registered: false,
+            readiness_hold: Some(ReadinessHold::take(
+                endpoint.drt().system_health(),
+                endpoint.name(),
+            )),
+            observed_weight_version: None,
+        }));
+        worker.register_serving_routes(&endpoint, state.clone());
+        worker.activate_engine_routes().await;
+
+        let routes = endpoint.drt().engine_routes();
+        let enable = routes.get(SERVING_ENABLE_ROUTE).unwrap();
+        let disable = routes.get(SERVING_DISABLE_ROUTE).unwrap();
+        let status = routes.get(SERVING_STATUS_ROUTE).unwrap();
+
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 0);
+        let missing = enable(serde_json::json!({})).await.unwrap();
+        assert!(control_response_is_error(&missing));
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 0);
+
+        let mismatch = enable(serde_json::json!({"expected_weight_version": "v0"}))
+            .await
+            .unwrap();
+        assert!(control_response_is_error(&mismatch));
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 0);
+
+        let enabled = enable(serde_json::json!({"expected_weight_version": "v1"}))
+            .await
+            .unwrap();
+        assert_eq!(enabled["status"], "ok");
+        assert_eq!(enabled["changed"], true);
+        assert_eq!(enabled["observed_weight_version"], "v1");
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 1);
+
+        let repeated = enable(serde_json::json!({"expected_weight_version": "v1"}))
+            .await
+            .unwrap();
+        assert_eq!(repeated["changed"], false);
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 1);
+
+        *weight_version.lock().unwrap() = "v2".to_string();
+        let stale = enable(serde_json::json!({"expected_weight_version": "v1"}))
+            .await
+            .unwrap();
+        assert!(control_response_is_error(&stale));
+        assert_eq!(
+            discovered_endpoint_count(&endpoint).await,
+            0,
+            "a failed fence must withdraw an already-published endpoint"
+        );
+
+        let enabled_v2 = enable(serde_json::json!({"expected_weight_version": "v2"}))
+            .await
+            .unwrap();
+        assert_eq!(enabled_v2["changed"], true);
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 1);
+
+        let disabled = disable(serde_json::json!({})).await.unwrap();
+        assert_eq!(disabled["changed"], true);
+        let repeated_disable = disable(serde_json::json!({})).await.unwrap();
+        assert_eq!(repeated_disable["changed"], false);
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 0);
+
+        let status = status(serde_json::json!({})).await.unwrap();
+        assert_eq!(status["serving"], false);
+        assert_eq!(status["observed_weight_version"], "v2");
+
+        worker.begin_engine_route_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deferred_worker_controls_cannot_bypass_serving_admission() {
+        let endpoint = test_local_endpoint().await;
+        let (engine, _) = HandoffMockEngine::new(
+            false,
+            vec!["sleep".to_string(), "wake_up".to_string()],
+            Vec::new(),
+        );
+        let worker = Worker::new(
+            engine,
+            WorkerConfig {
+                defer_serving: true,
+                ..WorkerConfig::default()
+            },
+        );
+        let state = Arc::new(tokio::sync::Mutex::new(ServingRegistrationState {
+            registered: false,
+            readiness_hold: Some(ReadinessHold::take(
+                endpoint.drt().system_health(),
+                endpoint.name(),
+            )),
+            observed_weight_version: None,
+        }));
+        worker
+            .register_engine_controls(&endpoint, Some(state.clone()))
+            .await
+            .unwrap();
+        worker.register_serving_routes(&endpoint, state);
+        worker.activate_engine_routes().await;
+
+        let routes = endpoint.drt().engine_routes();
+        let enable = routes.get(SERVING_ENABLE_ROUTE).unwrap();
+        let status = routes.get(SERVING_STATUS_ROUTE).unwrap();
+        let sleep = routes.get("control/sleep").unwrap();
+        let wake = routes.get("control/wake_up").unwrap();
+
+        let enabled = enable(serde_json::json!({})).await.unwrap();
+        assert_eq!(enabled["changed"], true);
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 1);
+
+        sleep(serde_json::json!({})).await.unwrap();
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 0);
+        assert_eq!(
+            status(serde_json::json!({})).await.unwrap()["serving"],
+            false
+        );
+
+        wake(serde_json::json!({})).await.unwrap();
+        assert_eq!(
+            discovered_endpoint_count(&endpoint).await,
+            0,
+            "wake must not bypass deferred serving admission"
+        );
+        assert_eq!(
+            status(serde_json::json!({})).await.unwrap()["serving"],
+            false
+        );
+
+        enable(serde_json::json!({})).await.unwrap();
+        assert_eq!(discovered_endpoint_count(&endpoint).await, 1);
+
+        worker.begin_engine_route_shutdown().await;
+    }
+
+    #[test]
+    fn weight_version_fence_cannot_be_required_without_deferred_serving() {
+        let config = WorkerConfig {
+            require_weight_version_fence: true,
+            ..WorkerConfig::default()
+        };
+        let error = validate_serving_config(&config).unwrap_err();
+        assert!(error.to_string().contains("requires defer_serving=true"));
+    }
+
     /// The trait default `on_endpoint_ready` is a no-op that succeeds against a
     /// real `Endpoint`.
     #[cfg(feature = "integration")]
@@ -3688,7 +4306,7 @@ mod handoff_and_lifecycle_tests {
             .await
             .expect("handoff should succeed");
         worker
-            .register_engine_controls(&endpoint)
+            .register_engine_controls(&endpoint, None)
             .await
             .expect("control registration should succeed");
         worker
@@ -3742,7 +4360,7 @@ mod handoff_and_lifecycle_tests {
             HandoffMockEngine::new(false, vec!["pause_generation".to_string()], Vec::new());
         let worker = Worker::new(engine, WorkerConfig::default());
         worker
-            .register_engine_controls(&endpoint)
+            .register_engine_controls(&endpoint, None)
             .await
             .expect("control registration should succeed");
 
@@ -3786,7 +4404,10 @@ mod handoff_and_lifecycle_tests {
             vec!["load_lora".to_string()],
         );
         let worker = Worker::new(engine, WorkerConfig::default());
-        worker.register_engine_controls(&endpoint).await.unwrap();
+        worker
+            .register_engine_controls(&endpoint, None)
+            .await
+            .unwrap();
         worker.register_engine_updates(&endpoint).await.unwrap();
         let routes = endpoint.drt().engine_routes();
         let control = routes.get("control/start_profile").unwrap();
@@ -3821,7 +4442,10 @@ mod handoff_and_lifecycle_tests {
         let endpoint = test_local_endpoint().await;
         let (engine, _) = HandoffMockEngine::new(false, vec!["wake_up".to_string()], Vec::new());
         let worker = Worker::new(engine, WorkerConfig::default());
-        worker.register_engine_controls(&endpoint).await.unwrap();
+        worker
+            .register_engine_controls(&endpoint, None)
+            .await
+            .unwrap();
         worker.activate_engine_routes().await;
 
         let callback = endpoint
@@ -3881,9 +4505,12 @@ mod handoff_and_lifecycle_tests {
             callback,
             EngineKind::Llm(Arc::new(DefaultsEngine)),
             endpoint.clone(),
-            worker.engine_route_lifecycle.clone(),
-            worker.engine_route_mutation.clone(),
-            worker.engine_route_shutdown.clone(),
+            EngineControlCoordination {
+                lifecycle: worker.engine_route_lifecycle.clone(),
+                mutation: worker.engine_route_mutation.clone(),
+                shutdown: worker.engine_route_shutdown.clone(),
+                serving_registration: None,
+            },
         );
         let request = tokio::spawn(async move { callback(serde_json::json!({})).await.unwrap() });
         entered.notified().await;
@@ -3939,9 +4566,12 @@ mod handoff_and_lifecycle_tests {
             resume_callback,
             EngineKind::Llm(Arc::new(DefaultsEngine)),
             endpoint.clone(),
-            worker.engine_route_lifecycle.clone(),
-            worker.engine_route_mutation.clone(),
-            worker.engine_route_shutdown.clone(),
+            EngineControlCoordination {
+                lifecycle: worker.engine_route_lifecycle.clone(),
+                mutation: worker.engine_route_mutation.clone(),
+                shutdown: worker.engine_route_shutdown.clone(),
+                serving_registration: None,
+            },
         );
         let resume_request =
             tokio::spawn(async move { resume_callback(serde_json::json!({})).await.unwrap() });
@@ -3954,9 +4584,12 @@ mod handoff_and_lifecycle_tests {
             direct_callback,
             EngineKind::Llm(Arc::new(DefaultsEngine)),
             endpoint,
-            worker.engine_route_lifecycle.clone(),
-            worker.engine_route_mutation.clone(),
-            worker.engine_route_shutdown.clone(),
+            EngineControlCoordination {
+                lifecycle: worker.engine_route_lifecycle.clone(),
+                mutation: worker.engine_route_mutation.clone(),
+                shutdown: worker.engine_route_shutdown.clone(),
+                serving_registration: None,
+            },
         );
         let response = tokio::time::timeout(
             Duration::from_secs(1),
@@ -4075,7 +4708,10 @@ mod handoff_and_lifecycle_tests {
             Vec::new(),
         );
         let worker = Worker::new(engine, WorkerConfig::default());
-        worker.register_engine_controls(&endpoint).await.unwrap();
+        worker
+            .register_engine_controls(&endpoint, None)
+            .await
+            .unwrap();
         worker.activate_engine_routes().await;
         endpoint.register_endpoint_instance().await.unwrap();
         set_worker_health(&endpoint, HealthStatus::Ready);
@@ -4144,7 +4780,10 @@ mod handoff_and_lifecycle_tests {
             Vec::new(),
         );
         let worker = Worker::new(engine, WorkerConfig::default());
-        worker.register_engine_controls(&endpoint).await.unwrap();
+        worker
+            .register_engine_controls(&endpoint, None)
+            .await
+            .unwrap();
         worker.activate_engine_routes().await;
         endpoint.register_endpoint_instance().await.unwrap();
 

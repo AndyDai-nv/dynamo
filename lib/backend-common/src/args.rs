@@ -100,6 +100,20 @@ pub struct CommonArgs {
     /// Publish this worker's engine control/update routes on the RL request-plane endpoint.
     #[arg(long, default_value_t = false, env = "DYN_ENABLE_RL")]
     pub enable_rl: bool,
+
+    /// Start the request handler but defer publishing its serving endpoint to discovery.
+    /// Use `/engine/serving/enable` after the engine is safe to receive traffic.
+    #[arg(long, default_value_t = false, env = "DYN_DEFER_SERVING")]
+    pub defer_serving: bool,
+
+    /// Require `/engine/serving/enable` to carry an `expected_weight_version`
+    /// fence that the engine validates before discovery registration.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "DYN_REQUIRE_WEIGHT_VERSION_FENCE"
+    )]
+    pub require_weight_version_fence: bool,
 }
 
 fn parse_worker_namespace(namespace: &str) -> Result<String, std::convert::Infallible> {
@@ -155,5 +169,18 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn parses_deferred_serving_flags() {
+        let defaults = TestArgs::try_parse_from(["test"]).unwrap();
+        assert!(!defaults.common.defer_serving);
+        assert!(!defaults.common.require_weight_version_fence);
+
+        let deferred =
+            TestArgs::try_parse_from(["test", "--defer-serving", "--require-weight-version-fence"])
+                .unwrap();
+        assert!(deferred.common.defer_serving);
+        assert!(deferred.common.require_weight_version_fence);
     }
 }
