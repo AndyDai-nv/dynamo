@@ -119,6 +119,8 @@ impl TrtllmSidecarEngine {
             disaggregation_mode: DisaggregationMode::Aggregated,
             route_to_encoder: false,
             enable_rl: args.sidecar.common.enable_rl,
+            defer_serving: args.sidecar.common.defer_serving,
+            require_weight_version_fence: args.sidecar.common.require_weight_version_fence,
             ..Default::default()
         };
         Ok((engine, config))

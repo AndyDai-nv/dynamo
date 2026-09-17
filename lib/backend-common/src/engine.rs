@@ -182,6 +182,14 @@ pub struct EngineConfig {
     pub llm: Option<LlmRegistration>,
 }
 
+/// Expected engine state that must be observed immediately before a deferred
+/// serving endpoint may join discovery.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServingFence {
+    /// Exact model-weight version expected by the controller.
+    pub weight_version: Option<String>,
+}
+
 /// Inference engine trait.
 ///
 /// Lifecycle:
@@ -419,6 +427,28 @@ pub trait LLMEngine: Send + Sync + 'static {
         _endpoint: dynamo_runtime::component::Endpoint,
     ) -> Result<(), DynamoError> {
         Ok(())
+    }
+
+    /// Validate controller-provided state immediately before discovery registration.
+    ///
+    /// Engines that expose mutable weights should return the observed state and reject
+    /// a mismatched expectation. The default accepts an empty fence and rejects any
+    /// requested weight-version check rather than silently registering unfenced.
+    async fn validate_serving_fence(
+        &self,
+        expected: ServingFence,
+    ) -> Result<ServingFence, DynamoError> {
+        if let Some(version) = expected.weight_version {
+            return Err(DynamoError::builder()
+                .error_type(crate::error::ErrorType::Backend(
+                    crate::error::BackendError::InvalidArgument,
+                ))
+                .message(format!(
+                    "engine does not support a weight-version serving fence (expected {version})"
+                ))
+                .build());
+        }
+        Ok(ServingFence::default())
     }
 }
 

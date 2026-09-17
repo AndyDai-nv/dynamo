@@ -276,6 +276,8 @@ impl MockerBackend {
             disaggregation_mode,
             route_to_encoder: args.common.route_to_encoder,
             enable_rl: args.common.enable_rl,
+            defer_serving: args.common.defer_serving,
+            require_weight_version_fence: args.common.require_weight_version_fence,
             model_name: args.model_path,
             served_model_name: Some(args.model_name),
             tool_call_parser,

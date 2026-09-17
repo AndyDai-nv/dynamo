@@ -548,6 +548,8 @@ impl WorkerConfig {
                 rl_metadata: None,
                 media_decoder: media_decoder.map(|decoder| decoder.inner),
                 media_fetcher: media_fetcher.map(|fetcher| fetcher.inner),
+                defer_serving: false,
+                require_weight_version_fence: false,
             },
         })
     }

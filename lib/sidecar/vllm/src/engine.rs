@@ -144,6 +144,8 @@ impl VllmSidecarEngine {
             route_to_encoder: args.sidecar.common.route_to_encoder,
             enable_rl,
             rl_metadata,
+            defer_serving: args.sidecar.common.defer_serving,
+            require_weight_version_fence: args.sidecar.common.require_weight_version_fence,
             ..Default::default()
         };
         Ok((engine, config))
