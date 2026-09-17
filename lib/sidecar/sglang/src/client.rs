@@ -145,6 +145,20 @@ pub async fn discover(client: &mut Client, deadline: Instant) -> Result<Discover
     parse_discovery(model, server, models)
 }
 
+/// Fetch the engine's current model metadata without repeating the other
+/// bootstrap discovery RPCs. Unlike the startup snapshot, this is suitable for
+/// serving-admission checks after a live weight update.
+pub async fn get_model_info(client: &mut Client, deadline: Instant) -> Result<Value, DynamoError> {
+    let model = rpc_with_deadline(
+        "GetModelInfo",
+        deadline,
+        client.get_model_info(pb::GetModelInfoRequest {}),
+    )
+    .await?
+    .into_inner();
+    parse_json_object("GetModelInfo.json_info", &model.json_info)
+}
+
 pub async fn health_check(client: &mut Client, deadline: Instant) -> Result<bool, DynamoError> {
     rpc_with_deadline(
         "HealthCheck",
