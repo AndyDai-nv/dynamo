@@ -540,7 +540,6 @@ async fn watch_engine_state(
 ) {
     let mut revision = 0;
     let mut healthy = None;
-    let mut server_status = None;
     let mut is_pause = None;
     let mut registered = true;
     loop {
@@ -602,7 +601,6 @@ async fn watch_engine_state(
                     instance_id = state.instance_id,
                     revision = state.revision,
                     healthy = state.healthy,
-                    server_status = ?state.server_status,
                     is_pause = state.is_pause,
                     "connected to SGLang engine-state stream"
                 );
@@ -651,16 +649,8 @@ async fn watch_engine_state(
             if healthy.is_some_and(|value| value != state.healthy) {
                 tracing::info!(
                     healthy = state.healthy,
-                    server_status = ?state.server_status,
                     registered,
                     "SGLang health state changed"
-                );
-            }
-            if server_status.is_some_and(|value| value != state.server_status) {
-                tracing::info!(
-                    server_status = ?state.server_status,
-                    healthy = state.healthy,
-                    "SGLang server status changed"
                 );
             }
             if is_pause.is_some_and(|value| value != state.is_pause) {
@@ -674,7 +664,6 @@ async fn watch_engine_state(
 
             revision = state.revision;
             healthy = Some(state.healthy);
-            server_status = Some(state.server_status);
             is_pause = Some(state.is_pause);
         }
 
