@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use dynamo_backend_common::{
     AsyncEngineContext, DisaggregationMode, DynamoError, EngineConfig, GenerateContext,
     KvEventSource, LLMEngine, LLMEngineOutput, LLMEngineOutputExt, LlmRegistration, ModelInput,
-    PreprocessedRequest, WorkerConfig, usage,
+    PreprocessedRequest, ServingFence, WorkerConfig, usage,
 };
 use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig, SidecarStartupError};
 use futures::stream::BoxStream;
@@ -125,6 +125,8 @@ impl SglangSidecarEngine {
             exclude_tools_when_tool_choice_none: common.exclude_tools_when_tool_choice_none,
             route_to_encoder: false,
             enable_rl: common.enable_rl,
+            defer_serving: common.defer_serving,
+            require_weight_version_fence: common.require_weight_version_fence,
             ..Default::default()
         };
 
@@ -475,6 +477,20 @@ impl LLMEngine for SglangSidecarEngine {
         Ok(())
     }
 
+    async fn validate_serving_fence(
+        &self,
+        expected: ServingFence,
+    ) -> Result<ServingFence, DynamoError> {
+        let state = self
+            .state
+            .get()
+            .ok_or_else(|| client::engine_shutdown("serving fence checked before sidecar start"))?;
+        let deadline = Instant::now() + self.transport.connect_attempt_timeout;
+        let mut control = state.pool.control_client();
+        let model_info = client::get_model_info(&mut control, deadline).await?;
+        validate_serving_weight_version(&model_info, expected)
+    }
+
     async fn kv_event_sources(&self) -> Result<Vec<KvEventSource>, DynamoError> {
         let state = self
             .state
@@ -529,6 +545,34 @@ fn discovery_string(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|entry| !entry.is_empty())
         .map(str::to_string)
+}
+
+fn validate_serving_weight_version(
+    model_info: &Value,
+    expected: ServingFence,
+) -> Result<ServingFence, DynamoError> {
+    let observed_weight_version = model_info
+        .get("weight_version")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string);
+
+    if let Some(expected_weight_version) = expected.weight_version.as_deref() {
+        let observed_weight_version = observed_weight_version.as_deref().ok_or_else(|| {
+            client::protocol_error(
+                "SGLang GetModelInfo did not report a string weight_version required by the serving fence",
+            )
+        })?;
+        if observed_weight_version != expected_weight_version {
+            return Err(client::invalid_arg(format!(
+                "weight-version serving fence mismatch: expected `{expected_weight_version}`, observed `{observed_weight_version}`"
+            )));
+        }
+    }
+
+    Ok(ServingFence {
+        weight_version: observed_weight_version,
+    })
 }
 
 fn discovery_bootstrap_port(discovery: &Discovery) -> Result<Option<u16>, DynamoError> {
@@ -975,8 +1019,9 @@ mod tests {
     use super::{
         DisaggregationMode, DiscoveredKvEventSource, Discovery, build_engine_config,
         discover_kv_event_sources, hicache_native_offloading_capacity,
-        resolve_bootstrap_host_with_local, sglang_eagle_enabled,
+        resolve_bootstrap_host_with_local, sglang_eagle_enabled, validate_serving_weight_version,
     };
+    use dynamo_backend_common::ServingFence;
 
     fn discovery(server_info: serde_json::Value) -> Discovery {
         Discovery {
@@ -987,6 +1032,42 @@ mod tests {
             model_info: json!({}),
             server_info,
         }
+    }
+
+    #[test]
+    fn serving_fence_requires_exact_sglang_weight_version() {
+        let model_info = json!({"weight_version": "policy-42"});
+
+        let observed = validate_serving_weight_version(
+            &model_info,
+            ServingFence {
+                weight_version: Some("policy-42".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(observed.weight_version.as_deref(), Some("policy-42"));
+
+        let mismatch = validate_serving_weight_version(
+            &model_info,
+            ServingFence {
+                weight_version: Some("policy-43".to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(mismatch.to_string().contains("expected `policy-43`"));
+        assert!(mismatch.to_string().contains("observed `policy-42`"));
+    }
+
+    #[test]
+    fn serving_fence_rejects_missing_sglang_weight_version() {
+        let error = validate_serving_weight_version(
+            &json!({}),
+            ServingFence {
+                weight_version: Some("policy-42".to_string()),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not report"));
     }
 
     #[test]

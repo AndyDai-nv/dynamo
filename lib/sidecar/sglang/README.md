@@ -42,6 +42,54 @@ The sidecar opens eight gRPC connections by default. Override the pool size with
 
 Connection startup uses a 30-second timeout per attempt, a one-second retry and readiness interval, and a 30-minute deadline for establishing the full connection pool. Override them with `--grpc-connect-attempt-timeout-secs`, `--grpc-retry-interval-secs`, and `--grpc-startup-deadline-secs`, or with the corresponding `DYN_SIDECAR_GRPC_*` environment variables.
 
+## Deferred serving registration
+
+Controllers that must prepare an engine before it receives traffic can start the
+sidecar with discovery registration deferred:
+
+```bash
+DYN_SYSTEM_PORT=8081 dynamo-sglang-sidecar \
+  --grpc-endpoint http://127.0.0.1:30001 \
+  --defer-serving \
+  --require-weight-version-fence
+```
+
+The request-plane handler, health target, and administrative routes start, but
+the serving endpoint is absent from discovery until explicitly enabled. The
+equivalent environment variables are `DYN_DEFER_SERVING=true` and
+`DYN_REQUIRE_WEIGHT_VERSION_FENCE=true`.
+
+After updating SGLang to the intended weights, enable routing through the
+sidecar's system server:
+
+```bash
+curl -sS http://127.0.0.1:8081/engine/serving/enable \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_weight_version":"policy-42"}'
+```
+
+Immediately before registration, the sidecar calls SGLang `GetModelInfo` again
+and compares its current `weight_version` with the expected value. A missing or
+mismatched version leaves the endpoint unregistered. If a mismatch is detected
+while the endpoint is already registered, the sidecar withdraws it from
+discovery before returning the error.
+
+Disable and inspect membership with:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8081/engine/serving/disable \
+  -H 'Content-Type: application/json' -d '{}'
+curl -sS http://127.0.0.1:8081/engine/serving/status
+```
+
+Enable and disable are idempotent and serialized with shutdown. A controller
+must still use the transaction order `disable -> drain -> update weights ->
+enable(expected version)`: the fence prevents stale re-admission, but it cannot
+prevent an independent actor from mutating SGLang after a successful enable.
+In deferred mode, any engine sleep/pause control also withdraws membership,
+while a wake/resume control restores only the engine: it never bypasses the
+separate, fenced serving-enable step.
+
 ## SGLang-managed module contract
 
 SGLang can load the Python entry point and supply the gRPC endpoint arguments:
