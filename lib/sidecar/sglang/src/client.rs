@@ -478,7 +478,7 @@ mod tests {
                 json_info: json!({"tokenizer_path": "tokenizer-repo"}).to_string(),
             }),
             server_info: Some(pb::GetServerInfoResponse {
-                json_info: json!({}).to_string(),
+                json_info: json!({"incremental_streaming_output": true}).to_string(),
             }),
         };
         let state = parse_engine_state(snapshot).unwrap();

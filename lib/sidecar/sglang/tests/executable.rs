@@ -29,6 +29,8 @@ fn executable_exposes_sglang_and_shared_sidecar_contracts() {
         "DYN_SIDECAR_GRPC_STARTUP_DEADLINE_SECS",
         "--unregister-on-pause",
         "DYN_SGLANG_UNREGISTER_ON_PAUSE",
+        "--policy-version-taints",
+        "DYN_SGLANG_POLICY_VERSION_TAINTS",
     ] {
         assert!(stdout.contains(expected), "help omits {expected}");
     }

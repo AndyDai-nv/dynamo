@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # SGLang sidecar
 
 > [!WARNING]
@@ -40,7 +45,96 @@ restores its discovery record so Dynamo clears stale KV-routing state. By
 default, the sidecar also removes the worker from discovery while generation
 is paused. Set `--unregister-on-pause=false` or
 `DYN_SGLANG_UNREGISTER_ON_PAUSE=false` to keep a paused worker in discovery.
-SGLang's computed health controls discovery.
+SGLang's computed health controls discovery. The engine-state stream requires
+`WatchEngineState` support; the older versions listed in the deployment examples
+below are not sufficient unless they include that RPC.
+
+The worker starts its request plane without publishing serving membership. Its
+single reconciliation task publishes membership only after the model card,
+handlers, administrative routes, and a ready engine observation exist. The
+SGLang watcher publishes observations; it never writes discovery itself.
+Unhealthy, paused (by default), disconnected, or invalid state observations
+withdraw membership. Reconnection accepts an equal first revision for the same
+engine; subsequent revisions must increase. Shutdown stops observations before
+the final deregistration, without cancelling active generation before draining.
+
+## Observed policy-version taints (opt-in)
+
+Start a compatible SGLang engine paused, using an SGLang build from the
+`sglang-miles` branch (not a stock wheel) for the Miles integration. Pin both
+the engine and Dynamo revisions and verify `WatchEngineState`, pause/resume,
+and the chosen weight-update transport in that build. Then start the sidecar:
+
+```bash
+dynamo-sglang-sidecar \
+    --grpc-endpoint http://127.0.0.1:30001 \
+    --namespace training-run-a \
+    --policy-version-taints
+```
+
+`DYN_SGLANG_POLICY_VERSION_TAINTS=true` is the equivalent environment setting.
+This mode requires `--unregister-on-pause=true` and does not support Dynamo's
+separate `--enable-rl` endpoint. Miles HTTP `/generate` is a different endpoint.
+
+For `weight_version="17"`, the model card receives
+`dynamo.policy/version=training-run-a:17`. Namespace and version are independently
+form-URL-encoded; for example `run/a` and `step:17` become
+`dynamo.policy/version=run%2Fa:step%3A17`. Use a unique namespace per training run.
+The worker reuses the existing discovery `update_model_taints` implementation:
+
+1. Withdraw endpoint membership.
+2. Replace its `dynamo.policy/` labels with the observed version, preserving
+   other existing labels and letting the taint API regenerate topology labels.
+3. Register only after the metadata update succeeds.
+
+Pause, unhealthy state, stream loss, or a missing/empty/non-string version
+withdraws the endpoint and clears its policy labels. A failed metadata update
+keeps it withdrawn and is retried. A changed engine instance forces withdrawal
+and re-registration even if the version string is unchanged.
+
+While this mode is active, `POST /engine/update/model_taints` rejects manual
+full-set replacement, including replacement of unrelated labels: the existing
+API replaces the whole set and cannot safely compete with the engine writer.
+This restriction is opt-in; other engines and non-policy mode retain the API.
+There are no `/engine/serving/enable`, `/disable`, or `/status` routes and no
+second controller-owned serving boolean.
+
+### Controller ordering and limits
+
+The controller owns the **expected** version; SGLang owns the **reported**
+version and generation pause state. For one update:
+
+```text
+Miles: stop submitting rollouts; resolve/drain/abort old requests as appropriate
+Miles -> SGLang: pause_generation (choose explicit abort/retract/in_place semantics)
+Miles -> SGLang: update weights; commit the complete update successfully
+Miles -> SGLang: read model info; verify actual weight_version == expected_version
+if mismatched or update failed: remain paused; do not resume
+Miles -> SGLang: continue_generation (HTTP equivalent: /continue_generation)
+SGLang -> sidecar: healthy, unpaused snapshot with the committed version
+worker: update actual-version taint, then publish membership
+Miles: wait for routing convergence, then submit the next rollout group
+```
+
+This PR does **not** implement the Miles-side verification/ordering above.
+An engine-reported version is not proof that every tensor or TP rank was updated.
+Do not relabel an engine with `/update_weight_version` to simulate a successful
+weight commit. Current engine state notifications cover pause and health;
+version-only config changes must also emit a state notification before they can
+be used safely without a pause/resume boundary. The supported controller
+contract here commits and verifies while paused, before resuming.
+
+Discovery and router caches converge asynchronously. Taint publication is not
+an atomic distributed barrier, and deregistration does not drain existing
+requests or stop clients with cached/direct endpoints. SGLang pause semantics
+remain the execution-side control. These changes are not a per-request version
+fence.
+
+For routing paths that already propagate constraints, callers can require the
+exact label through `nvext.routing_constraints.required_taints`. Requests
+without that constraint remain unconstrained. Native `/generate` constraint
+projection and round-robin constraint enforcement still require follow-ups;
+this PR must not be described as complete version-fenced RL routing.
 
 SGLang remains the source of truth for the worker's aggregated, prefill, or decode role. The inherited `--disaggregation-mode` option and `DYN_DISAGGREGATION_MODE` environment variable have no effect in this sidecar. The SGLang sidecar rejects `--route-to-encoder` because its native protocol does not support encoder workers. Disaggregated workers continue to register under their fixed role components; aggregated workers honor `--component` or `DYN_COMPONENT`.
 
