@@ -211,6 +211,54 @@ pub async fn watch_engine_state(
     .map(tonic::Response::into_inner)
 }
 
+/// Point-in-time check, not a tensor checksum or a per-request version fence.
+/// Bracket a fresh GetModelInfo with instance snapshots so a restarted engine
+/// cannot inherit approval just because it reports the same weight version.
+pub async fn verify_admission(
+    client: &mut Client,
+    expected: &dynamo_backend_common::admission::AdmissionIdentity,
+    deadline: Instant,
+) -> Result<(), DynamoError> {
+    async fn check_instance(
+        client: &mut Client,
+        expected: u64,
+        deadline: Instant,
+    ) -> Result<(), DynamoError> {
+        let mut stream = watch_engine_state(client, deadline).await?;
+        let snapshot = rpc_with_deadline("WatchEngineState snapshot", deadline, stream.message())
+            .await?
+            .ok_or_else(|| {
+                protocol_error("engine-state stream closed before admission snapshot")
+            })?;
+        let state = parse_engine_state(snapshot)?;
+        if state.instance_id != expected || !state.healthy || state.is_pause {
+            return Err(invalid_arg(
+                "admission requires the expected healthy, unpaused engine instance",
+            ));
+        }
+        Ok(())
+    }
+
+    check_instance(client, expected.engine_instance_id, deadline).await?;
+    let model = rpc_with_deadline(
+        "GetModelInfo admission",
+        deadline,
+        client.get_model_info(pb::GetModelInfoRequest {}),
+    )
+    .await?
+    .into_inner();
+    let info = parse_json_object("GetModelInfo.json_info", &model.json_info)?;
+    if expected.weight_version.trim().is_empty()
+        || info.get("weight_version").and_then(Value::as_str)
+            != Some(expected.weight_version.as_str())
+    {
+        return Err(invalid_arg(
+            "live engine weight_version does not match controller admission",
+        ));
+    }
+    check_instance(client, expected.engine_instance_id, deadline).await
+}
+
 pub fn parse_engine_state(snapshot: pb::EngineStateSnapshot) -> Result<EngineState, DynamoError> {
     if snapshot.instance_id == 0 {
         return Err(protocol_error(
@@ -478,7 +526,7 @@ mod tests {
                 json_info: json!({"tokenizer_path": "tokenizer-repo"}).to_string(),
             }),
             server_info: Some(pb::GetServerInfoResponse {
-                json_info: json!({}).to_string(),
+                json_info: json!({"incremental_streaming_output": true}).to_string(),
             }),
         };
         let state = parse_engine_state(snapshot).unwrap();
