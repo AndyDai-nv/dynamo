@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # SGLang sidecar
 
 > [!WARNING]
@@ -40,7 +45,157 @@ restores its discovery record so Dynamo clears stale KV-routing state. By
 default, the sidecar also removes the worker from discovery while generation
 is paused. Set `--unregister-on-pause=false` or
 `DYN_SGLANG_UNREGISTER_ON_PAUSE=false` to keep a paused worker in discovery.
-SGLang's computed health controls discovery.
+SGLang's computed health controls discovery. The engine-state stream requires
+`WatchEngineState` support; the older versions listed in the deployment examples
+below are not sufficient unless they include that RPC.
+
+The worker starts its request plane without publishing serving membership. Its
+single reconciliation task publishes membership only after the model card,
+handlers, administrative routes, and a ready engine observation exist. The
+SGLang watcher publishes observations; it never writes discovery itself.
+Unhealthy, paused (by default), disconnected, or invalid state observations
+withdraw membership. Reconnection accepts an equal first revision for the same
+engine; subsequent revisions must increase. Shutdown stops observations before
+the final deregistration, without cancelling active generation before draining.
+
+## Controller-managed admission (opt-in, Miles)
+
+For Miles, build SGLang from the `sglang-miles` branch, not a stock wheel.
+Pin the engine and Dynamo revisions and verify native `WatchEngineState`,
+pause/resume, and the chosen weight-update transport in that build.
+The engine can start healthy and unpaused; it does **not** need to start paused
+to prevent discovery registration:
+
+```bash
+DYN_SYSTEM_PORT=8081 dynamo-sglang-sidecar \
+    --grpc-endpoint http://127.0.0.1:30001 \
+    --namespace training-run-a \
+    --controller-managed
+```
+
+`DYN_SGLANG_CONTROLLER_MANAGED=true` is equivalent. Managed mode requires
+`--unregister-on-pause=true` and does not support the separate `--enable-rl`
+endpoint. Miles HTTP `/generate` is a different endpoint.
+
+The state stream proposed in Dynamo #14985 supplies **engine facts**, not
+controller permission. Membership requires both:
+
+```text
+controller grant for this sidecar session + engine instance + stream epoch + version
+    AND a healthy, unpaused, matching engine observation
+    -> shared worker publishes discovery
+```
+
+Only the shared worker writes discovery. SGLang remains the authority on
+execution state and reported version; Miles decides whether that worker belongs
+in the current rollout pool. `continue_generation` cannot grant membership.
+Without `--controller-managed`, observed-ready automatic registration remains
+available, including same-version restart recovery.
+
+### Startup and one weight update
+
+The controller addresses the **individual sidecar's system listener**, not the
+Dynamo frontend and not SGLang's HTTP port. Protect that listener with network
+access controls. Session/instance tokens are not authentication credentials.
+
+```bash
+curl --fail-with-body http://127.0.0.1:8081/engine/admission/status \
+    -H 'Content-Type: application/json' -d '{}'
+```
+
+Initially `admitted=false`, `published=false`, even with `engine_ready=true`.
+Read the returned `session` and `observed` identity. Validate that it is the
+worker Miles intends to use. The expected version comes from **Miles's completed
+weight update**, not by blindly copying the engine's reported version.
+
+For example, after Miles has successfully committed version `17` and resumed
+the engine, assuming status returned session `abc-1`, instance `42`, epoch `1`:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8081/engine/admission/admit \
+    -H 'Content-Type: application/json' \
+    -d '{"session":"abc-1","revision":1,"expected":{"engine_instance_id":42,"observation_epoch":1,"weight_version":"17"}}'
+```
+
+The sidecar checks its current observation, then brackets a **fresh
+GetModelInfo** with fresh state-stream snapshots checking instance, health and
+pause state. It compares the live version to the requested version and rechecks
+the persistent observation afterward. A mismatch, disconnect, RPC failure, or
+timeout leaves the command unapproved. The shared worker subsequently publishes
+membership; the handler itself never registers the endpoint.
+
+Poll status until that revision is applied, `admitted=true`, and
+`published=true`; fail/reconcile if a newer command or error appears.
+This acknowledges local discovery writes, **not all routers' cache convergence**.
+
+Before the next update, revoke permission explicitly:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8081/engine/admission/withdraw \
+    -H 'Content-Type: application/json' \
+    -d '{"session":"abc-1","revision":2}'
+```
+
+Wait for `applied_revision=2` and `published=false`. The overall sequence is:
+
+```text
+Miles: stop submissions; resolve/drain/abort old requests as appropriate
+Miles -> sidecar: withdraw; wait for local discovery withdrawal
+Miles -> SGLang: pause_generation; update weights; commit version 18; resume
+                   (resume is allowed before Miles approves pool membership)
+Miles: validate current worker identity against its update snapshot
+Miles -> sidecar: admit revision 3, expected version 18 + current instance/epoch
+sidecar: verify live facts; shared worker publishes membership
+Miles: complete routing readiness checks; start the next rollout group
+```
+
+This PR adds the Dynamo-side contract, not the Miles controller implementation.
+See [the full admission protocol](../../backend-common/ADMISSION.md) for retry,
+status, timeout, and security semantics. Exact duplicate commands only return
+status; a failed or invalidated approval requires a newer revision. Restarted
+sidecars have a new session and begin unapproved. Engine restart, version change,
+stream loss, or reconnect epoch change revokes permission. Pause/health changes
+alone preserve a matching grant, allowing same-instance/same-version recovery;
+withdraw first when Miles must prevent that recovery.
+
+Engine-reported versions are not proof that every tensor or TP rank updated.
+Do not relabel an engine to simulate a successful commit. Version-only config
+changes may not emit state notifications; the controller must use the normal
+pause/update/commit/resume boundary and wait for a matching state snapshot.
+The live check prevents approval based only on stale cached metadata.
+
+### Optional observed policy-version taints
+
+Add `--policy-version-taints` (or `DYN_SGLANG_POLICY_VERSION_TAINTS=true`)
+to project actual versions into model-card labels. It works independently of
+controller-managed mode and does not replace admission or live verification.
+It also requires `--unregister-on-pause=true`.
+
+For `weight_version="17"`, the label is
+`dynamo.policy/version=training-run-a:17`. Namespace and version are
+independently form-URL-encoded: `run/a` and `step:17` become
+`dynamo.policy/version=run%2Fa:step%3A17`. Use a unique namespace per run.
+The membership owner withdraws, calls the existing `update_model_taints`
+implementation, then registers only if the update succeeds. Other labels are
+preserved and topology labels regenerated. While withdrawn, policy labels are
+cleared. Missing/empty/non-string versions or metadata failures keep it
+withdrawn; failed discovery updates are retried.
+
+In this opt-in mode, `POST /engine/update/model_taints` rejects manual full-set
+replacement, even for unrelated labels, to avoid competing writers. Other
+engines and non-policy mode retain that API.
+
+### Limits
+
+Discovery changes are asynchronous. Withdrawal does not drain requests or stop
+cached/direct endpoint callers; native engine pause remains the execution-side
+control. This is an **admission-time version check**, not a per-request fence.
+
+Routing paths that propagate constraints can require the exact label through
+`nvext.routing_constraints.required_taints`. Unconstrained requests remain
+unconstrained. Native `/generate` constraint projection and round-robin
+constraint enforcement require follow-ups. Do not claim complete version-fenced
+RL routing or GPU/TP weight-update validation from the unit/mocker tests.
 
 SGLang remains the source of truth for the worker's aggregated, prefill, or decode role. The inherited `--disaggregation-mode` option and `DYN_DISAGGREGATION_MODE` environment variable have no effect in this sidecar. The SGLang sidecar rejects `--route-to-encoder` because its native protocol does not support encoder workers. Disaggregated workers continue to register under their fixed role components; aggregated workers honor `--component` or `DYN_COMPONENT`.
 

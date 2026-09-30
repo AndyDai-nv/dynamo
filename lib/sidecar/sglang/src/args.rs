@@ -32,4 +32,14 @@ pub struct Args {
         action = clap::ArgAction::Set
     )]
     pub unregister_on_pause: bool,
+
+    /// Start outside discovery and require explicit controller admission.
+    /// Requires unregister-on-pause; healthy/resumed alone never grants admission.
+    #[arg(long, env = "DYN_SGLANG_CONTROLLER_MANAGED")]
+    pub controller_managed: bool,
+
+    /// Project engine-reported weight_version into namespace-scoped policy taints.
+    /// Missing versions keep the endpoint unregistered. Requires unregister-on-pause.
+    #[arg(long, env = "DYN_SGLANG_POLICY_VERSION_TAINTS")]
+    pub policy_version_taints: bool,
 }
