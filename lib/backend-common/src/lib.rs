@@ -21,6 +21,7 @@ pub mod metrics;
 mod publisher;
 mod rl;
 pub mod run;
+pub mod serving;
 pub mod snapshot_publisher;
 pub mod telemetry;
 #[cfg(any(test, feature = "testing"))]
@@ -46,5 +47,6 @@ pub use error::{BackendError, DynamoError, ErrorType};
 pub use metrics::{ComponentGauges, EngineMetrics, LifecycleGauges};
 pub use rl::{RlAdminBaseUrl, RlWorkerMetadata};
 pub use run::{run, run_raw};
+pub use serving::{EngineServingState, EngineServingStates};
 pub use snapshot_publisher::SnapshotPublisher;
 pub use worker::{RuntimeConfig, Worker, WorkerConfig};

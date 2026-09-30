@@ -194,10 +194,17 @@ pub struct EngineConfig {
 ///   5. `cleanup()` — called once on shutdown, release all resources.
 #[async_trait]
 pub trait LLMEngine: Send + Sync + 'static {
+    /// Opt into engine-observed serving membership. The worker starts deferred
+    /// and is the sole discovery writer; `None` preserves the legacy lifecycle.
+    fn serving_states(&self) -> Option<crate::serving::EngineServingStates> {
+        None
+    }
+
     /// Start the engine and return registration metadata.
     ///
     /// After this returns, the engine MUST be ready to accept `generate()`
-    /// calls. `Worker` will register the model and begin serving immediately.
+    /// calls unless it supplies `serving_states()`. Observed engines can remain
+    /// paused: `Worker` starts deferred and waits for an eligible observation.
     /// Use interior mutability for any state allocated here.
     ///
     /// `worker_id` is an opaque, runtime-allocated unique identifier for
