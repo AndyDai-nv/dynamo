@@ -117,6 +117,8 @@ impl RuntimeConfig {
 /// Per-worker runtime configuration.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
+    /// Require a controller grant before an observed engine may join discovery.
+    pub controller_managed: bool,
     /// Dynamo namespace for discovery routing.
     pub namespace: String,
     /// Component name within the namespace.
@@ -210,6 +212,7 @@ impl WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
+            controller_managed: false,
             namespace: "dynamo".to_string(),
             component: "backend".to_string(),
             endpoint: "generate".to_string(),
@@ -276,6 +279,24 @@ pub(crate) enum EngineKind {
 }
 
 impl EngineKind {
+    pub(crate) async fn verify_serving_admission(
+        &self,
+        expected: &crate::admission::AdmissionIdentity,
+    ) -> Result<(), DynamoError> {
+        match self {
+            Self::Llm(engine) => engine.verify_serving_admission(expected).await,
+            Self::Raw(_) => Err(err(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                "raw engines do not support controller admission",
+            )),
+        }
+    }
+    fn serving_states(&self) -> Option<crate::serving::EngineServingStates> {
+        match self {
+            Self::Llm(engine) => engine.serving_states(),
+            Self::Raw(_) => None,
+        }
+    }
     async fn start(&self, worker_id: u64) -> Result<EngineConfig, DynamoError> {
         match self {
             EngineKind::Llm(e) => e.start(worker_id).await,
@@ -940,6 +961,19 @@ impl Worker {
         endpoint: dynamo_runtime::component::Endpoint,
         shutdown: CancellationToken,
     ) -> Result<(), DynamoError> {
+        let serving_states = self.engine.serving_states();
+        if self.config.controller_managed && serving_states.is_none() {
+            return Err(err(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                "controller-managed admission requires an engine observation source",
+            ));
+        }
+        if serving_states.is_some() && self.config.enable_rl {
+            return Err(err(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                "engine-observed membership does not yet manage the separate RL endpoint",
+            ));
+        }
         let model_type = resolve_model_type(&self.config)?;
         let (worker_type, needs) = resolve_worker_type_and_needs(&self.config);
         let rl_config = if self.config.enable_rl {
@@ -1090,6 +1124,7 @@ impl Worker {
 
         let mut builder = endpoint
             .endpoint_builder()
+            .initially_registered(serving_states.is_none())
             .handler(ingress)
             .metrics_labels(metrics_labels)
             .graceful_shutdown(true);
@@ -1197,8 +1232,32 @@ impl Worker {
         // hold taken before registration is what kept the runtime from reporting
         // ready before this point; drop it here, because the write below
         // publishes readiness through the very signal it suppresses.
-        drop(readiness_hold);
-        set_worker_health(&endpoint, HealthStatus::Ready);
+        let mut membership_task = if let Some(states) = serving_states {
+            set_worker_health(&endpoint, HealthStatus::NotReady);
+            let admission = self.config.controller_managed.then(|| {
+                let admission = crate::admission::ControllerAdmission::new(&endpoint);
+                admission.register_routes(
+                    &endpoint,
+                    self.engine.clone(),
+                    states.clone(),
+                    self.engine_route_mutation.clone(),
+                    self.engine_route_shutdown.clone(),
+                );
+                admission
+            });
+            Some(tokio::spawn(crate::serving::follow_engine_state(
+                endpoint.clone(),
+                states,
+                self.engine_route_mutation.clone(),
+                self.engine_route_shutdown.clone(),
+                readiness_hold,
+                admission,
+            )))
+        } else {
+            drop(readiness_hold);
+            set_worker_health(&endpoint, HealthStatus::Ready);
+            None
+        };
 
         let serve_fut = primary_endpoint.wait();
         tokio::pin!(serve_fut);
@@ -1229,12 +1288,27 @@ impl Worker {
                 tracing::info!("Received shutdown signal; running graceful orchestration");
                 Ok(())
             }
+            result = async {
+                match membership_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                membership_task = None;
+                Err(err(ErrorType::Backend(BackendError::Unknown),
+                    format!("engine membership task exited unexpectedly: {result:?}")))
+            }
         };
 
         // Cancel accepted Rust route futures, wait for their shared lifecycle
         // guards and any discovery-mutation critical section, then close the
         // routes. No resume callback can re-register after the final unregister.
         self.begin_engine_route_shutdown().await;
+        if let Some(task) = membership_task
+            && let Err(error) = task.await
+        {
+            tracing::warn!(%error, "engine membership task failed during shutdown");
+        }
 
         // Symmetric with the ready write: stop advertising ready before the
         // orchestrator drains and unregisters.
@@ -1355,7 +1429,10 @@ impl Worker {
 /// `Ready` goes through `set_endpoint_registered`, which skips the endpoint
 /// layer whenever that endpoint owns a canary target. Writing the target
 /// `Ready` here instead would report readiness the canary has not yet verified.
-fn set_worker_health(endpoint: &dynamo_runtime::component::Endpoint, status: HealthStatus) {
+pub(crate) fn set_worker_health(
+    endpoint: &dynamo_runtime::component::Endpoint,
+    status: HealthStatus,
+) {
     let system_health = endpoint.drt().system_health();
     let mut system_health = system_health.lock();
     match status {
@@ -1752,7 +1829,13 @@ fn wrap_engine_control_callback(
     route_mutation: Arc<tokio::sync::Mutex<()>>,
     route_shutdown: CancellationToken,
 ) -> EngineRouteCallback {
-    let policy = engine_control_policy(&control_name);
+    // An observed engine owns pause/health facts. Its shared reconciler is the
+    // sole registration writer; a successful resume RPC is not an admission ack.
+    let policy = if engine.serving_states().is_some() {
+        EngineControlPolicy::Direct
+    } else {
+        engine_control_policy(&control_name)
+    };
     Arc::new(move |body| {
         let callback = callback.clone();
         let engine = engine.clone();
