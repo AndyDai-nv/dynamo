@@ -3,24 +3,27 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Controller-managed discovery admission
+# Controller-managed admission
 
-`WorkerConfig.controller_managed = true` requires explicit controller permission
-before an observed engine joins discovery. This is pool membership, not an
-engine pause flag. The default is false; engines without a serving observation
-source cannot opt in. Engine adapters must implement `verify_serving_admission`
-to re-read actual engine identity/version/readiness; the default fails closed.
+`WorkerConfig.controller_managed` defaults to false. When enabled, an observed
+engine needs controller permission and a matching ready observation to join
+discovery. Adapters must implement `verify_serving_admission`; its default
+fails closed. Only the shared worker writes discovery.
 
-The worker installs these **POST** routes on its runtime system server only in
-managed mode, after normal startup finishes:
+## API
 
-- `/engine/admission/status`, body `{}`.
-- `/engine/admission/admit`, body shown below.
-- `/engine/admission/withdraw`, body with only `session` and `revision`.
+Enable the worker's system listener with `DYN_SYSTEM_PORT` and restrict access
+to trusted controllers. These POST routes exist only in managed mode:
+
+| Route | JSON body |
+| --- | --- |
+| `/engine/admission/status` | `{}` |
+| `/engine/admission/admit` | Example below |
+| `/engine/admission/withdraw` | `{"session":"<from status>","revision":2}` |
 
 ```json
 {
-  "session": "<copy from status>",
+  "session": "<from status>",
   "revision": 1,
   "expected": {
     "engine_instance_id": 42,
@@ -30,57 +33,29 @@ managed mode, after normal startup finishes:
 }
 ```
 
-The controller first reads status, validates its run/worker association, and
-uses the observed incarnation and observation epoch, but its **own expected
-weight version**. It must not blindly approve whatever version status reports.
-The administrative listener must be restricted to trusted controllers; these
-identity fields are fencing tokens, not authentication credentials.
+Validate the worker association, take instance/epoch from status's `observed`,
+and supply the controller's expected version, not blindly the reported version.
+Use one command writer and increasing positive revisions per session. Exact
+retries return status without reviving failed/revoked permission; stale or
+conflicting commands are rejected. A valid newer command clears prior permission
+even if verification fails; retry failures with a new revision.
 
-Each mutation needs a positive, strictly increasing revision within the returned
-sidecar session. Retries with the exact same operation/body are idempotent and
-only report current state. A same-revision different command or older revision
-is rejected. A valid newer command supersedes previous permission even if its
-subsequent engine verification fails or is cancelled. Retry a failed verification
-with a **new** revision after fixing the cause; reusing its revision does not
-turn failure into permission. Coordinate a single revision writer per sidecar.
+Admission checks observations before/after live verification (ten-second limit).
+Status separates `admitted` (permission), `engine_ready` (observation), and
+`published` (local discovery result; null means unknown/shutting down).
+After a command, wait for its `applied_revision` and intended `published` value
+(and `admitted=true` for admission); check `revision`/`last_error` for
+superseding commands or failures. HTTP success is not a publication barrier.
 
-`admit` checks the observation, bounds the engine's live verification to ten
-seconds, rechecks the observation, and records intent under the same mutation
-lock used by discovery and shutdown. It does not call engine resume. `withdraw`
-revokes intent but does not pause or drain execution. Only the shared membership
-task writes discovery. Regular engine resume cannot create controller permission.
+Instance/version changes, observation loss, producer closure, or a new stream
+epoch revoke permission. Producers must advance epochs on reconnect, even when
+disconnect updates coalesce. Sidecar restart creates a new session. Pause/health
+changes preserve a matching grant, allowing automatic recovery; resume alone
+cannot create a grant.
 
-Responses/status distinguish:
-
-- `admitted`: a current controller grant exists (not necessarily routable).
-- `engine_ready`: the latest observed engine execution state.
-- `published`: local discovery RPC outcome; null means unknown/shutting down.
-- `revision`: latest accepted controller mutation.
-- `applied_revision`: latest mutation successfully reconciled with discovery.
-- `last_error`: most recent verification/reconciliation/invalidation error.
-- `observed`: identity and version from the engine observation (or null).
-
-An HTTP success is **not** an admission-success or router-convergence barrier.
-After admit, wait for the intended revision to be applied, `admitted=true`, and
-`published=true`; surface errors or newer commands instead of waiting forever.
-After withdraw, wait for its applied revision and `published=false`. These are
-local discovery acknowledgments, not acknowledgments from all frontend caches.
-
-Pause/health changes withdraw membership without erasing a still-matching grant;
-the same engine/version may rejoin after recovery. A changed engine identity,
-version, missing observation, closed producer, or changed observation epoch
-revokes permission and requires a fresh controller approval. Producers must
-advance the epoch on reconnect so a coalesced disconnect cannot preserve an old
-grant. Sidecar restart creates a new session and begins unapproved.
-
-For weight updates, stop/resolve rollout submissions and withdraw first, then
-perform the native engine pause/update/commit/resume protocol. Admit only after
-the controller validates the resulting worker instance and version. New workers
-may be healthy and unpaused while awaiting their first grant, matching a
-controller's `PendingWeights` state. Engine controls, version labels, and resume
-are not substitutes for that grant.
-
-This API does not reject direct or stale-routed requests, implement a distributed
-drain, prove tensor/TP-rank consistency, or enforce per-request policy versions.
-Controllers still own in-flight request handling and rollout round boundaries.
-The separate `--enable-rl` discovery endpoint is unsupported in observed mode.
+Before updating weights, stop/resolve submissions, withdraw and await publication,
+then pause/update/commit/resume the engine and admit the validated instance/version.
+Withdrawal does not pause/drain execution. Session tokens are not authentication;
+discovery acknowledgments are not router-cache convergence, a per-request fence,
+or proof of tensor/TP-rank consistency. Observed mode does not support the separate
+`--enable-rl` endpoint.
