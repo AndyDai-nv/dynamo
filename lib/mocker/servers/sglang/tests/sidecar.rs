@@ -146,6 +146,38 @@ async fn collect_with_context(
 }
 
 #[tokio::test]
+async fn admission_verifies_live_weight_version_and_engine_incarnation() {
+    use dynamo_backend_common::admission::AdmissionIdentity;
+    use dynamo_sglang_sidecar::proto::{
+        WatchEngineStateRequest, sglang_service_client::SglangServiceClient,
+    };
+
+    let server = RunningServer::start(ServerMode::Aggregated, fast_engine_args()).await;
+    let engine = sidecar(&server.endpoint, DisaggregationMode::Aggregated).await;
+    engine.start(0).await.unwrap();
+    let mut client = SglangServiceClient::connect(server.endpoint.clone())
+        .await
+        .unwrap();
+    let mut stream = client
+        .watch_engine_state(WatchEngineStateRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let snapshot = stream.message().await.unwrap().unwrap();
+    let mut expected = AdmissionIdentity {
+        engine_instance_id: snapshot.instance_id,
+        observation_epoch: 1, // The shared worker, not this RPC helper, validates epochs.
+        weight_version: "mock-0".into(),
+    };
+    engine.verify_serving_admission(&expected).await.unwrap();
+    expected.weight_version = "not-installed".into();
+    assert!(engine.verify_serving_admission(&expected).await.is_err());
+    expected.weight_version = "mock-0".into();
+    expected.engine_instance_id = 0;
+    assert!(engine.verify_serving_admission(&expected).await.is_err());
+}
+
+#[tokio::test]
 async fn sidecar_streams_incremental_mocker_tokens_logprobs_and_usage() {
     let server = RunningServer::start(ServerMode::Aggregated, fast_engine_args()).await;
     let engine = sidecar(&server.endpoint, DisaggregationMode::Aggregated).await;
