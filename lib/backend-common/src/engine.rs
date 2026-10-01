@@ -200,6 +200,20 @@ pub trait LLMEngine: Send + Sync + 'static {
         None
     }
 
+    /// Re-read engine facts before accepting a controller's scoped admission.
+    /// Implementations must not mutate pause state or discovery here.
+    async fn verify_serving_admission(
+        &self,
+        _expected: &crate::admission::AdmissionIdentity,
+    ) -> Result<(), DynamoError> {
+        Err(DynamoError::builder()
+            .error_type(crate::error::ErrorType::Backend(
+                crate::error::BackendError::InvalidArgument,
+            ))
+            .message("engine does not support controller admission verification")
+            .build())
+    }
+
     /// Start the engine and return registration metadata.
     ///
     /// After this returns, the engine MUST be ready to accept `generate()`

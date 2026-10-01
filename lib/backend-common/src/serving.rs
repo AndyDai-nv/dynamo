@@ -19,6 +19,9 @@ pub struct EngineServingState {
     pub instance_id: u64,
     pub revision: u64,
     pub ready: bool,
+    /// Changes on reconnect even if engine incarnation/revision are unchanged.
+    pub observation_epoch: u64,
+    pub weight_version: Option<String>,
 }
 
 /// `None` means unknown/disconnected and withdraws membership. Closing the sender
@@ -34,28 +37,42 @@ pub(crate) async fn follow_engine_state(
     mutation: Arc<Mutex<()>>,
     shutdown: CancellationToken,
     readiness_hold: ReadinessHold,
+    admission: Option<Arc<crate::admission::ControllerAdmission>>,
 ) {
     let mut registered_instance = None;
     let mut readiness_hold = Some(readiness_hold);
     let mut closed = false;
+    let mut commands = admission.as_ref().map(|gate| gate.changes());
     loop {
-        let observation = if closed {
-            None
-        } else {
-            states.borrow_and_update().clone()
-        };
         let result = {
             let _guard = mutation.lock().await;
             if shutdown.is_cancelled() {
                 return;
             }
-            reconcile(
+            let mut observation = if closed {
+                None
+            } else {
+                states.borrow_and_update().clone()
+            };
+            if let Some(gate) = &admission
+                && !gate.permits(observation.as_ref())
+            {
+                observation = None;
+            }
+            let result = reconcile(
                 &endpoint,
                 &mut registered_instance,
                 &mut readiness_hold,
                 observation.as_ref(),
             )
-            .await
+            .await;
+            if let Some(gate) = &admission {
+                gate.applied(
+                    result.as_ref().ok().map(|_| registered_instance.is_some()),
+                    result.as_ref().err().map(ToString::to_string),
+                );
+            }
+            result
         };
         let retry = match result {
             Ok(()) => false,
@@ -74,6 +91,10 @@ pub(crate) async fn follow_engine_state(
             changed = states.changed(), if !closed => {
                 closed = changed.is_err();
             }
+            _ = async { match &mut commands {
+                Some(commands) => { let _ = commands.changed().await; },
+                None => std::future::pending().await,
+            }} => {}
             _ = tokio::time::sleep(Duration::from_millis(250)), if retry => {}
         }
     }
@@ -172,6 +193,7 @@ mod tests {
             mutation.clone(),
             shutdown.clone(),
             ReadinessHold::take(endpoint.drt().system_health(), endpoint.name()),
+            None,
         ));
         assert_eq!(count(&endpoint).await, 0);
 
@@ -179,12 +201,16 @@ mod tests {
             instance_id: 1,
             revision: 1,
             ready: false,
+            observation_epoch: 1,
+            weight_version: Some("1".into()),
         }));
         assert_eq!(count(&endpoint).await, 0);
         tx.send_replace(Some(EngineServingState {
             instance_id: 1,
             revision: 2,
             ready: true,
+            observation_epoch: 1,
+            weight_version: Some("1".into()),
         }));
         wait_count(&endpoint, 1).await;
         tx.send_replace(None);
@@ -202,18 +228,24 @@ mod tests {
             instance_id: 2,
             revision: 1,
             ready: true,
+            observation_epoch: 1,
+            weight_version: Some("1".into()),
         }));
         wait_count(&endpoint, 1).await;
         tx.send_replace(Some(EngineServingState {
             instance_id: 2,
             revision: 2,
             ready: false,
+            observation_epoch: 1,
+            weight_version: Some("1".into()),
         }));
         wait_count(&endpoint, 0).await;
         tx.send_replace(Some(EngineServingState {
             instance_id: 2,
             revision: 3,
             ready: true,
+            observation_epoch: 1,
+            weight_version: Some("1".into()),
         }));
         wait_count(&endpoint, 1).await;
 
@@ -225,6 +257,8 @@ mod tests {
             instance_id: 3,
             revision: 1,
             ready: true,
+            observation_epoch: 1,
+            weight_version: Some("1".into()),
         }));
         task.await.unwrap();
         assert_eq!(count(&endpoint).await, 0);
@@ -255,6 +289,8 @@ mod tests {
             instance_id: 1,
             revision: 1,
             ready: true,
+            observation_epoch: 1,
+            weight_version: Some("1".into()),
         }));
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(follow_engine_state(
@@ -263,6 +299,7 @@ mod tests {
             Arc::new(Mutex::new(())),
             shutdown.clone(),
             ReadinessHold::take(endpoint.drt().system_health(), endpoint.name()),
+            None,
         ));
         wait_count(&endpoint, 1).await;
         drop(tx);

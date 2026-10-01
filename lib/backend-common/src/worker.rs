@@ -117,6 +117,8 @@ impl RuntimeConfig {
 /// Per-worker runtime configuration.
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
+    /// Require a controller grant before an observed engine may join discovery.
+    pub controller_managed: bool,
     /// Dynamo namespace for discovery routing.
     pub namespace: String,
     /// Component name within the namespace.
@@ -210,6 +212,7 @@ impl WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
+            controller_managed: false,
             namespace: "dynamo".to_string(),
             component: "backend".to_string(),
             endpoint: "generate".to_string(),
@@ -276,6 +279,18 @@ pub(crate) enum EngineKind {
 }
 
 impl EngineKind {
+    pub(crate) async fn verify_serving_admission(
+        &self,
+        expected: &crate::admission::AdmissionIdentity,
+    ) -> Result<(), DynamoError> {
+        match self {
+            Self::Llm(engine) => engine.verify_serving_admission(expected).await,
+            Self::Raw(_) => Err(err(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                "raw engines do not support controller admission",
+            )),
+        }
+    }
     fn serving_states(&self) -> Option<crate::serving::EngineServingStates> {
         match self {
             Self::Llm(engine) => engine.serving_states(),
@@ -947,6 +962,12 @@ impl Worker {
         shutdown: CancellationToken,
     ) -> Result<(), DynamoError> {
         let serving_states = self.engine.serving_states();
+        if self.config.controller_managed && serving_states.is_none() {
+            return Err(err(
+                ErrorType::Backend(BackendError::InvalidArgument),
+                "controller-managed admission requires an engine observation source",
+            ));
+        }
         if serving_states.is_some() && self.config.enable_rl {
             return Err(err(
                 ErrorType::Backend(BackendError::InvalidArgument),
@@ -1213,12 +1234,24 @@ impl Worker {
         // publishes readiness through the very signal it suppresses.
         let mut membership_task = if let Some(states) = serving_states {
             set_worker_health(&endpoint, HealthStatus::NotReady);
+            let admission = self.config.controller_managed.then(|| {
+                let admission = crate::admission::ControllerAdmission::new(&endpoint);
+                admission.register_routes(
+                    &endpoint,
+                    self.engine.clone(),
+                    states.clone(),
+                    self.engine_route_mutation.clone(),
+                    self.engine_route_shutdown.clone(),
+                );
+                admission
+            });
             Some(tokio::spawn(crate::serving::follow_engine_state(
                 endpoint.clone(),
                 states,
                 self.engine_route_mutation.clone(),
                 self.engine_route_shutdown.clone(),
                 readiness_hold,
+                admission,
             )))
         } else {
             drop(readiness_hold);
