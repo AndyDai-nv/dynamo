@@ -492,7 +492,8 @@ mod tests {
     use tonic::transport::Endpoint;
 
     use super::{
-        client_from_channel, discover, json_u32, json_u64, parse_discovery, parse_engine_state,
+        client_from_channel, discover, discover_engine_state, json_u32, json_u64, parse_discovery,
+        parse_engine_state,
     };
     use crate::proto as pb;
 
@@ -577,9 +578,17 @@ mod tests {
         let mut client = client_from_channel(channel);
         let started = Instant::now();
         let result = discover(&mut client, started + Duration::from_millis(100)).await;
+        let startup_error = discover_engine_state(
+            &mut client,
+            pb::EngineStateSnapshot::default(),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
         peer.abort();
 
         assert!(result.is_err());
+        assert!(startup_error.to_string().contains("ListModels"));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
