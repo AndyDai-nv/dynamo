@@ -1408,14 +1408,22 @@ impl Worker {
     /// poll [`is_quiescent`](LLMEngine::is_quiescent) every
     /// `DRAIN_POLL_INTERVAL_S`, exiting on `Some(true)` or when the budget
     /// expires. Budget = `DYN_PREFILL_DRAIN_TIMEOUT_S` capped at
-    /// `graceful_shutdown_timeout - CLEANUP_RESERVE_S`.
+    /// `graceful_shutdown_timeout - CLEANUP_RESERVE_S`, less the discovery
+    /// withdrawal allowance for observed engines.
     async fn drain_until_idle_or_deadline(&self) {
         if !self.config.disaggregation_mode.is_prefill() {
             return;
         }
-        let configured = drain_timeout_secs();
-        let cap = (graceful_shutdown_timeout().as_secs_f64() - CLEANUP_RESERVE_S).max(0.0);
-        let budget = configured.min(cap);
+        let discovery_reserve = if self.engine.serving_states().is_some() {
+            discovery_operation_timeout()
+        } else {
+            Duration::ZERO
+        };
+        let budget = drain_budget_secs(
+            drain_timeout_secs(),
+            graceful_shutdown_timeout(),
+            discovery_reserve,
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs_f64(budget);
         let start = std::time::Instant::now();
         let mut last_heartbeat = start;
@@ -1554,6 +1562,10 @@ fn discovery_operation_timeout() -> Duration {
     // Discovery must not consume the drain/cleanup budget, even with a short
     // configured shutdown deadline. This applies only to observed engines.
     (graceful_shutdown_timeout() / 4).min(Duration::from_secs(5))
+}
+
+fn drain_budget_secs(configured: f64, shutdown: Duration, discovery: Duration) -> f64 {
+    configured.min((shutdown.saturating_sub(discovery).as_secs_f64() - CLEANUP_RESERVE_S).max(0.0))
 }
 
 fn graceful_shutdown_timeout_secs(value: Option<&str>, default: u64) -> u64 {
@@ -3315,6 +3327,22 @@ mod tests {
             vec!["start", "is_quiescent", "cleanup"]
         );
         assert_eq!(worker.state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn observed_drain_preserves_cleanup_budget_after_discovery_timeout() {
+        assert_eq!(
+            drain_budget_secs(30.0, Duration::from_secs(30), Duration::from_secs(5)),
+            20.0
+        );
+        assert_eq!(
+            drain_budget_secs(30.0, Duration::from_secs(30), Duration::ZERO),
+            25.0
+        );
+        assert_eq!(
+            drain_budget_secs(30.0, Duration::from_secs(5), Duration::from_secs(1)),
+            0.0
+        );
     }
 
     // ENV_LOCK must span the `.await` below: it serializes the env set/restore
