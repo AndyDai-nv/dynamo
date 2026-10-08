@@ -186,16 +186,33 @@ pub async fn discover(client: &mut Client, deadline: Instant) -> Result<Discover
     )
     .await?
     .into_inner();
-    let models = rpc_with_deadline(
+    let models = list_models(client, deadline).await?;
+
+    parse_discovery(model, server, models)
+}
+
+async fn list_models(
+    client: &mut Client,
+    deadline: Instant,
+) -> Result<Vec<pb::ModelCard>, DynamoError> {
+    Ok(rpc_with_deadline(
         "ListModels",
         deadline,
         client.list_models(pb::ListModelsRequest {}),
     )
     .await?
     .into_inner()
-    .models;
+    .models)
+}
 
-    parse_discovery(model, server, models)
+/// Complete startup metadata with the model context window, not the scheduler's
+/// input-token limit. Lifecycle observations do not need to fetch this model list.
+pub async fn discover_engine_state(
+    client: &mut Client,
+    snapshot: pb::EngineStateSnapshot,
+    deadline: Instant,
+) -> Result<EngineState, DynamoError> {
+    parse_engine_state_with_models(snapshot, list_models(client, deadline).await?)
 }
 
 pub async fn watch_engine_state(
@@ -260,6 +277,13 @@ pub async fn verify_admission(
 }
 
 pub fn parse_engine_state(snapshot: pb::EngineStateSnapshot) -> Result<EngineState, DynamoError> {
+    parse_engine_state_with_models(snapshot, Vec::new())
+}
+
+pub(crate) fn parse_engine_state_with_models(
+    snapshot: pb::EngineStateSnapshot,
+    models: Vec<pb::ModelCard>,
+) -> Result<EngineState, DynamoError> {
     if snapshot.instance_id == 0 {
         return Err(protocol_error(
             "SGLang WatchEngineState returned a zero instance_id",
@@ -281,7 +305,7 @@ pub fn parse_engine_state(snapshot: pb::EngineStateSnapshot) -> Result<EngineSta
         revision: snapshot.revision,
         healthy: snapshot.healthy,
         is_pause: snapshot.is_pause,
-        discovery: parse_discovery(model, server, Vec::new())?,
+        discovery: parse_discovery(model, server, models)?,
     })
 }
 

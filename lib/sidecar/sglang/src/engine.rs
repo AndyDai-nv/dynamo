@@ -204,7 +204,11 @@ impl LLMEngine for SglangSidecarEngine {
                 .ok_or_else(|| {
                     client::engine_shutdown("SGLang closed the engine-state stream during startup")
                 })?;
-            let state = client::parse_engine_state(snapshot)?;
+            let state = if snapshot.healthy {
+                client::discover_engine_state(&mut control, snapshot, deadline).await?
+            } else {
+                client::parse_engine_state(snapshot)?
+            };
             if state.healthy {
                 break state;
             }
@@ -1207,6 +1211,44 @@ fn build_engine_config(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streamed_startup_preserves_model_context_in_engine_config() {
+        for input_limit in [8186, 4090] {
+            let state = crate::client::parse_engine_state_with_models(
+                crate::proto::EngineStateSnapshot {
+                    instance_id: 42,
+                    revision: 1,
+                    healthy: true,
+                    is_pause: false,
+                    model_info: Some(crate::proto::GetModelInfoResponse {
+                        model_path: "model-repo".into(),
+                        json_info: "{}".into(),
+                    }),
+                    server_info: Some(crate::proto::GetServerInfoResponse {
+                        json_info: serde_json::json!({
+                            "incremental_streaming_output": true,
+                            "context_length": null,
+                            "max_req_input_len": input_limit,
+                        })
+                        .to_string(),
+                    }),
+                },
+                vec![crate::proto::ModelCard {
+                    id: "served-model".into(),
+                    root: "model-repo".into(),
+                    max_model_len: Some(8192),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            let config =
+                build_engine_config(&state.discovery, DisaggregationMode::Aggregated, None, None)
+                    .unwrap();
+            assert_eq!(config.llm.unwrap().context_length, Some(8192));
+            assert_eq!(config.served_model_name.as_deref(), Some("served-model"));
+        }
+    }
+
     use dynamo_sidecar_common::GrpcEndpoint;
     use serde_json::json;
 
