@@ -33,6 +33,15 @@ pub struct Discovery {
     pub server_info: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct EngineState {
+    pub instance_id: u64,
+    pub revision: u64,
+    pub healthy: bool,
+    pub is_pause: bool,
+    pub discovery: Discovery,
+}
+
 /// `bootstrap`: true when called before `dynamo_backend_common::run` installs
 /// the global tracing subscriber (the `bootstrap_discover` path during
 /// `from_args()`), false once running inside `LLMEngine::start` (via
@@ -177,26 +186,127 @@ pub async fn discover(client: &mut Client, deadline: Instant) -> Result<Discover
     )
     .await?
     .into_inner();
-    let models = rpc_with_deadline(
+    let models = list_models(client, deadline).await?;
+
+    parse_discovery(model, server, models)
+}
+
+async fn list_models(
+    client: &mut Client,
+    deadline: Instant,
+) -> Result<Vec<pb::ModelCard>, DynamoError> {
+    Ok(rpc_with_deadline(
         "ListModels",
         deadline,
         client.list_models(pb::ListModelsRequest {}),
     )
     .await?
     .into_inner()
-    .models;
-
-    parse_discovery(model, server, models)
+    .models)
 }
 
-pub async fn health_check(client: &mut Client, deadline: Instant) -> Result<bool, DynamoError> {
+/// Complete startup metadata with the model context window, not the scheduler's
+/// input-token limit. Lifecycle observations do not need to fetch this model list.
+pub async fn discover_engine_state(
+    client: &mut Client,
+    snapshot: pb::EngineStateSnapshot,
+    deadline: Instant,
+) -> Result<EngineState, DynamoError> {
+    parse_engine_state_with_models(snapshot, list_models(client, deadline).await?)
+}
+
+pub async fn watch_engine_state(
+    client: &mut Client,
+    deadline: Instant,
+) -> Result<tonic::Streaming<pb::EngineStateSnapshot>, DynamoError> {
     rpc_with_deadline(
-        "HealthCheck",
+        "WatchEngineState",
         deadline,
-        client.health_check(pb::HealthCheckRequest {}),
+        client.watch_engine_state(pb::WatchEngineStateRequest {}),
     )
     .await
-    .map(|response| response.into_inner().healthy)
+    .map(tonic::Response::into_inner)
+}
+
+/// Point-in-time check, not a tensor checksum or a per-request version fence.
+/// Bracket a fresh GetModelInfo with instance snapshots so a restarted engine
+/// cannot inherit approval just because it reports the same weight version.
+pub async fn verify_admission(
+    client: &mut Client,
+    expected: &dynamo_backend_common::admission::AdmissionIdentity,
+    deadline: Instant,
+) -> Result<(), DynamoError> {
+    async fn check_instance(
+        client: &mut Client,
+        expected: u64,
+        deadline: Instant,
+    ) -> Result<(), DynamoError> {
+        let mut stream = watch_engine_state(client, deadline).await?;
+        let snapshot = rpc_with_deadline("WatchEngineState snapshot", deadline, stream.message())
+            .await?
+            .ok_or_else(|| {
+                protocol_error("engine-state stream closed before admission snapshot")
+            })?;
+        let state = parse_engine_state(snapshot)?;
+        if state.instance_id != expected || !state.healthy || state.is_pause {
+            return Err(invalid_arg(
+                "admission requires the expected healthy, unpaused engine instance",
+            ));
+        }
+        Ok(())
+    }
+
+    check_instance(client, expected.engine_instance_id, deadline).await?;
+    let model = rpc_with_deadline(
+        "GetModelInfo admission",
+        deadline,
+        client.get_model_info(pb::GetModelInfoRequest {}),
+    )
+    .await?
+    .into_inner();
+    let info = parse_json_object("GetModelInfo.json_info", &model.json_info)?;
+    if expected.weight_version.trim().is_empty()
+        || info.get("weight_version").and_then(Value::as_str)
+            != Some(expected.weight_version.as_str())
+    {
+        return Err(invalid_arg(
+            "live engine weight_version does not match controller admission",
+        ));
+    }
+    check_instance(client, expected.engine_instance_id, deadline).await
+}
+
+pub fn parse_engine_state(snapshot: pb::EngineStateSnapshot) -> Result<EngineState, DynamoError> {
+    parse_engine_state_with_models(snapshot, Vec::new())
+}
+
+pub(crate) fn parse_engine_state_with_models(
+    snapshot: pb::EngineStateSnapshot,
+    models: Vec<pb::ModelCard>,
+) -> Result<EngineState, DynamoError> {
+    if snapshot.instance_id == 0 {
+        return Err(protocol_error(
+            "SGLang WatchEngineState returned a zero instance_id",
+        ));
+    }
+    if snapshot.revision == 0 {
+        return Err(protocol_error(
+            "SGLang WatchEngineState returned a zero revision",
+        ));
+    }
+    let model = snapshot
+        .model_info
+        .ok_or_else(|| protocol_error("SGLang engine state omitted model_info"))?;
+    let server = snapshot
+        .server_info
+        .ok_or_else(|| protocol_error("SGLang engine state omitted server_info"))?;
+    Ok(EngineState {
+        instance_id: snapshot.instance_id,
+        revision: snapshot.revision,
+        healthy: snapshot.healthy,
+        is_pause: snapshot.is_pause,
+        discovery: parse_discovery(model, server, models)?,
+    })
 }
 
 pub async fn abort(
@@ -381,7 +491,10 @@ mod tests {
     use tokio::time::Instant;
     use tonic::transport::Endpoint;
 
-    use super::{client_from_channel, discover, json_u32, json_u64, parse_discovery};
+    use super::{
+        client_from_channel, discover, discover_engine_state, json_u32, json_u64, parse_discovery,
+        parse_engine_state,
+    };
     use crate::proto as pb;
 
     #[test]
@@ -426,6 +539,31 @@ mod tests {
         assert!(error.contains("--incremental-streaming-output"), "{error}");
     }
 
+    #[test]
+    fn engine_state_requires_an_instance_and_full_discovery_snapshot() {
+        let snapshot = pb::EngineStateSnapshot {
+            instance_id: 42,
+            revision: 7,
+            healthy: true,
+            is_pause: true,
+            model_info: Some(pb::GetModelInfoResponse {
+                model_path: "model-repo".to_string(),
+                json_info: json!({"tokenizer_path": "tokenizer-repo"}).to_string(),
+            }),
+            server_info: Some(pb::GetServerInfoResponse {
+                json_info: json!({"incremental_streaming_output": true}).to_string(),
+            }),
+        };
+        let state = parse_engine_state(snapshot).unwrap();
+        assert_eq!(state.instance_id, 42);
+        assert_eq!(state.revision, 7);
+        assert!(state.healthy);
+        assert!(state.is_pause);
+        assert_eq!(state.discovery.tokenizer_path, "tokenizer-repo");
+
+        assert!(parse_engine_state(pb::EngineStateSnapshot::default()).is_err());
+    }
+
     #[tokio::test]
     async fn discovery_deadline_bounds_a_half_open_peer() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -440,9 +578,17 @@ mod tests {
         let mut client = client_from_channel(channel);
         let started = Instant::now();
         let result = discover(&mut client, started + Duration::from_millis(100)).await;
+        let startup_error = discover_engine_state(
+            &mut client,
+            pb::EngineStateSnapshot::default(),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
         peer.abort();
 
         assert!(result.is_err());
+        assert!(startup_error.to_string().contains("ListModels"));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
