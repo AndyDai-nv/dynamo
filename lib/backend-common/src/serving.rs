@@ -180,8 +180,7 @@ mod tests {
         let started = endpoint
             .endpoint_builder()
             .handler(Ingress::<SingleIn<String>, ManyOut<Annotated<String>>>::new())
-            .initially_registered(false)
-            .start_with_registration()
+            .start_without_registration()
             .await
             .unwrap();
         let (tx, rx) = watch::channel(None);
@@ -281,8 +280,7 @@ mod tests {
         let started = endpoint
             .endpoint_builder()
             .handler(Ingress::<SingleIn<String>, ManyOut<Annotated<String>>>::new())
-            .initially_registered(false)
-            .start_with_registration()
+            .start_without_registration()
             .await
             .unwrap();
         let (tx, rx) = watch::channel(Some(EngineServingState {

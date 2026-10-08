@@ -1124,7 +1124,6 @@ impl Worker {
 
         let mut builder = endpoint
             .endpoint_builder()
-            .initially_registered(serving_states.is_none())
             .handler(ingress)
             .metrics_labels(metrics_labels)
             .graceful_shutdown(true);
@@ -1147,7 +1146,13 @@ impl Worker {
         // endpoint also covers the RL endpoint registered further down.
         let readiness_hold = ReadinessHold::take(endpoint.drt().system_health(), endpoint.name());
 
-        let start_fut = builder.start_with_registration();
+        let start_fut = async {
+            if serving_states.is_some() {
+                builder.start_without_registration().await
+            } else {
+                builder.start_with_registration().await
+            }
+        };
         tokio::pin!(start_fut);
         let primary_endpoint = tokio::select! {
             biased;
