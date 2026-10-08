@@ -375,8 +375,7 @@ mod tests {
         let started = endpoint
             .endpoint_builder()
             .handler(Ingress::<SingleIn<String>, ManyOut<Annotated<String>>>::new())
-            .initially_registered(false)
-            .start_with_registration()
+            .start_without_registration()
             .await
             .unwrap();
         let gate = ControllerAdmission::new(&endpoint);
@@ -406,7 +405,11 @@ mod tests {
             "expected": AdmissionIdentity::from_observation(state).unwrap() })
         };
         let task = tokio::spawn(crate::serving::follow_engine_state(
-            endpoint.clone(),
+            crate::serving::EndpointMembership::new(
+                endpoint.clone(),
+                started.instance(),
+                Duration::from_secs(1),
+            ),
             rx,
             mutation,
             shutdown.clone(),
