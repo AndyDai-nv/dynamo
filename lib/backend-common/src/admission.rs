@@ -404,7 +404,11 @@ mod tests {
             "expected": AdmissionIdentity::from_observation(state).unwrap() })
         };
         let task = tokio::spawn(crate::serving::follow_engine_state(
-            endpoint.clone(),
+            crate::serving::EndpointMembership::new(
+                endpoint.clone(),
+                started.instance(),
+                Duration::from_secs(1),
+            ),
             rx,
             mutation,
             shutdown.clone(),

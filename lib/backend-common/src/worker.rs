@@ -884,12 +884,36 @@ impl Worker {
     /// grace period → engine drain → cleanup. Shared by every shutdown path —
     /// pre-serve (mid-start signal) and the serve loop's signal arm.
     async fn orchestrator_steps(&mut self, endpoint: &dynamo_runtime::component::Endpoint) {
-        if let Err(e) = endpoint.unregister_endpoint_instance().await {
+        let timeout = self
+            .engine
+            .serving_states()
+            .is_some()
+            .then(discovery_operation_timeout);
+        self.orchestrator_steps_with_withdrawal(
+            endpoint.unregister_endpoint_instance(),
+            timeout,
+            grace_period_secs(),
+        )
+        .await;
+    }
+
+    async fn orchestrator_steps_with_withdrawal(
+        &mut self,
+        withdrawal: impl std::future::Future<Output = anyhow::Result<()>>,
+        timeout: Option<Duration>,
+        grace: f64,
+    ) {
+        let result = if let Some(timeout) = timeout {
+            crate::serving::bounded_discovery(timeout, withdrawal).await
+        } else {
+            withdrawal.await
+        };
+        if let Err(e) = result {
             tracing::warn!(error = %e, "discovery unregister failed");
         } else {
             tracing::info!("Endpoint unregistered from discovery");
         }
-        self.run_engine_shutdown_steps().await;
+        self.run_engine_shutdown_steps_with_grace(grace).await;
     }
 
     /// Start the engine exactly once. `Worker::run` consumes `self`, so all
@@ -1146,8 +1170,9 @@ impl Worker {
         // endpoint also covers the RL endpoint registered further down.
         let readiness_hold = ReadinessHold::take(endpoint.drt().system_health(), endpoint.name());
 
-        let start_fut = async {
-            if serving_states.is_some() {
+        let defer_registration = serving_states.is_some();
+        let start_fut = async move {
+            if defer_registration {
                 builder.start_without_registration().await
             } else {
                 builder.start_with_registration().await
@@ -1251,7 +1276,11 @@ impl Worker {
                 admission
             });
             Some(tokio::spawn(crate::serving::follow_engine_state(
-                endpoint.clone(),
+                crate::serving::EndpointMembership::new(
+                    endpoint.clone(),
+                    primary_endpoint.instance(),
+                    discovery_operation_timeout(),
+                ),
                 states,
                 self.engine_route_mutation.clone(),
                 self.engine_route_shutdown.clone(),
@@ -1333,13 +1362,8 @@ impl Worker {
     /// `engine.is_quiescent()` → `cleanup_once()`. Each engine step swallows
     /// non-fatal failures so a misbehaving engine can't block the worker
     /// from exiting.
-    async fn run_engine_shutdown_steps(&mut self) {
-        self.run_engine_shutdown_steps_with_grace(grace_period_secs())
-            .await
-    }
-
-    /// Same as [`run_engine_shutdown_steps`] but with an explicit grace
-    /// period. Lets unit tests assert on call ordering without setting
+    ///
+    /// An explicit grace period lets unit tests assert on call ordering without setting
     /// `DYN_GRACEFUL_SHUTDOWN_GRACE_PERIOD_SECS` (which is process-global
     /// and would race other parallel tests).
     async fn run_engine_shutdown_steps_with_grace(&mut self, grace: f64) {
@@ -1505,6 +1529,12 @@ fn graceful_shutdown_timeout() -> Duration {
     let value = std::env::var(env_worker::DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT).ok();
     let secs = graceful_shutdown_timeout_secs(value.as_deref(), default);
     Duration::from_secs(secs)
+}
+
+fn discovery_operation_timeout() -> Duration {
+    // Discovery must not consume the drain/cleanup budget, even with a short
+    // configured shutdown deadline. This applies only to observed engines.
+    (graceful_shutdown_timeout() / 4).min(Duration::from_secs(5))
 }
 
 fn graceful_shutdown_timeout_secs(value: Option<&str>, default: u64) -> u64 {
@@ -3240,6 +3270,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stalled_final_withdrawal_does_not_skip_drain_or_cleanup() {
+        let (engine, log) = OrderingMockEngine::new(false);
+        let mut worker = worker_with_prefill(engine);
+        worker.start_engine(0).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            worker.orchestrator_steps_with_withdrawal(
+                std::future::pending(),
+                Some(Duration::from_millis(20)),
+                0.0,
+            ),
+        )
+        .await
+        .expect("discovery must leave time for engine cleanup");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["start", "is_quiescent", "cleanup"]
+        );
+        assert_eq!(worker.state, LifecycleState::Stopped);
+    }
+
     // ENV_LOCK must span the `.await` below: it serializes the env set/restore
     // window against other env-mutating drain tests, and the value must stay
     // pinned while the awaited drain loop reads it. No code reachable from the
@@ -3298,8 +3350,8 @@ mod tests {
     // The "drain skipped when engine never started" scenario isn't
     // reachable through the public `Worker::run` flow — pre-start
     // shutdown returns from `run_inner` before `serve_with_orchestrator`
-    // (and therefore `run_engine_shutdown_steps`) ever runs. So we don't
-    // pin a contract for run_engine_shutdown_steps in the Stopped state.
+    // (and therefore `run_engine_shutdown_steps_with_grace`) ever runs. So we don't
+    // pin a contract for run_engine_shutdown_steps_with_grace in the Stopped state.
 
     #[test]
     fn grace_period_default_when_unset() {

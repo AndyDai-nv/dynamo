@@ -6,8 +6,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use dynamo_runtime::component::Endpoint;
+use dynamo_runtime::component::{Endpoint, Instance};
 use dynamo_runtime::config::HealthStatus;
+use dynamo_runtime::discovery::{Discovery, DiscoveryInstance, DiscoverySpec};
 use dynamo_runtime::system_health::ReadinessHold;
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use tokio::sync::{Mutex, watch};
@@ -28,24 +29,78 @@ pub struct EngineServingState {
 /// also withdraws membership. Engines must never mutate discovery themselves.
 pub type EngineServingStates = watch::Receiver<Option<EngineServingState>>;
 
+/// Discovery operations for the exact request-plane instance started by the worker.
+pub(crate) struct EndpointMembership {
+    endpoint: Endpoint,
+    discovery: Arc<dyn Discovery>,
+    instance: Instance,
+    timeout: Duration,
+}
+
+impl EndpointMembership {
+    pub(crate) fn new(endpoint: Endpoint, instance: &Instance, timeout: Duration) -> Self {
+        Self {
+            discovery: endpoint.drt().discovery(),
+            endpoint,
+            instance: instance.clone(),
+            timeout,
+        }
+    }
+
+    async fn register(&self) -> anyhow::Result<()> {
+        let instance = &self.instance;
+        self.discovery
+            .register(DiscoverySpec::Endpoint {
+                namespace: instance.namespace.clone(),
+                component: instance.component.clone(),
+                endpoint: instance.endpoint.clone(),
+                transport: instance.transport.clone(),
+                device_type: instance.device_type.clone(),
+                request_plane_codec: instance.request_plane_codec,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn unregister(&self) -> anyhow::Result<()> {
+        self.discovery
+            .unregister(DiscoveryInstance::Endpoint(self.instance.clone()))
+            .await
+    }
+}
+
+pub(crate) async fn bounded_discovery<T>(
+    timeout: Duration,
+    operation: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(timeout, operation)
+        .await
+        .map_err(|_| anyhow::anyhow!("discovery operation exceeded {timeout:?}; outcome unknown"))?
+}
+
 /// Runs only after the request handler and model card exist. A deferred endpoint
 /// remains absent until the first eligible observation. The mutation lock is also
-/// used by shutdown, so the final unregister cannot be followed by a late register.
+/// used by shutdown, so no local registration can start after final withdrawal.
 pub(crate) async fn follow_engine_state(
-    endpoint: Endpoint,
+    membership: EndpointMembership,
     mut states: EngineServingStates,
     mutation: Arc<Mutex<()>>,
     shutdown: CancellationToken,
     readiness_hold: ReadinessHold,
     admission: Option<Arc<crate::admission::ControllerAdmission>>,
 ) {
+    let endpoint = &membership.endpoint;
     let mut registered_instance = None;
     let mut readiness_hold = Some(readiness_hold);
     let mut closed = false;
     let mut commands = admission.as_ref().map(|gate| gate.changes());
     loop {
         let result = {
-            let _guard = mutation.lock().await;
+            let _guard = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                guard = mutation.lock() => guard,
+            };
             if shutdown.is_cancelled() {
                 return;
             }
@@ -59,13 +114,25 @@ pub(crate) async fn follow_engine_state(
             {
                 observation = None;
             }
-            let result = reconcile(
-                &endpoint,
-                &mut registered_instance,
-                &mut readiness_hold,
-                observation.as_ref(),
-            )
-            .await;
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => Err(anyhow::anyhow!(
+                    "discovery reconciliation cancelled; outcome unknown"
+                )),
+                result = bounded_discovery(membership.timeout, reconcile(
+                    &membership,
+                    &mut registered_instance,
+                    &mut readiness_hold,
+                    observation.as_ref(),
+                )) => result,
+            };
+            if result.is_err() {
+                registered_instance = None;
+                readiness_hold.get_or_insert_with(|| {
+                    ReadinessHold::take(endpoint.drt().system_health(), endpoint.name())
+                });
+                super::worker::set_worker_health(endpoint, HealthStatus::NotReady);
+            }
             if let Some(gate) = &admission {
                 gate.applied(
                     result.as_ref().ok().map(|_| registered_instance.is_some()),
@@ -79,8 +146,6 @@ pub(crate) async fn follow_engine_state(
             Err(error) => {
                 // A failed RPC may have taken effect remotely. Forget the local
                 // cache and force an unregister before attempting registration again.
-                registered_instance = None;
-                super::worker::set_worker_health(&endpoint, HealthStatus::NotReady);
                 tracing::warn!(%error, "engine membership reconciliation failed; retrying");
                 true
             }
@@ -101,11 +166,12 @@ pub(crate) async fn follow_engine_state(
 }
 
 async fn reconcile(
-    endpoint: &Endpoint,
+    membership: &EndpointMembership,
     registered_instance: &mut Option<u64>,
     readiness_hold: &mut Option<ReadinessHold>,
     observation: Option<&EngineServingState>,
 ) -> anyhow::Result<()> {
+    let endpoint = &membership.endpoint;
     let eligible = observation.filter(|state| state.ready);
     if eligible.is_some_and(|state| Some(state.instance_id) == *registered_instance) {
         return Ok(());
@@ -117,10 +183,10 @@ async fn reconcile(
         ReadinessHold::take(endpoint.drt().system_health(), endpoint.name())
     });
     super::worker::set_worker_health(endpoint, HealthStatus::NotReady);
-    endpoint.unregister_endpoint_instance().await?;
+    membership.unregister().await?;
     *registered_instance = None;
     if let Some(state) = eligible {
-        endpoint.register_endpoint_instance().await?;
+        membership.register().await?;
         *registered_instance = Some(state.instance_id);
         drop(readiness_hold.take());
         super::worker::set_worker_health(endpoint, HealthStatus::Ready);
@@ -139,6 +205,149 @@ mod tests {
         protocols::annotated::Annotated,
         traits::DistributedRuntimeProvider,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    struct StalledDiscovery {
+        inner: Arc<dyn Discovery>,
+        publish_before_stall: bool,
+        entered: Notify,
+        release: Notify,
+        dropped: Notify,
+        completed: AtomicUsize,
+    }
+
+    struct NotifyOnDrop<'a>(&'a Notify);
+
+    impl Drop for NotifyOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Discovery for StalledDiscovery {
+        fn instance_id(&self) -> u64 {
+            self.inner.instance_id()
+        }
+
+        async fn register_internal(
+            &self,
+            spec: DiscoverySpec,
+        ) -> anyhow::Result<DiscoveryInstance> {
+            let _dropped = NotifyOnDrop(&self.dropped);
+            if self.publish_before_stall {
+                self.inner.register(spec.clone()).await?;
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+            let instance = self.inner.register(spec).await?;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(instance)
+        }
+
+        async fn unregister(&self, instance: DiscoveryInstance) -> anyhow::Result<()> {
+            self.inner.unregister(instance).await
+        }
+
+        async fn list(&self, query: DiscoveryQuery) -> anyhow::Result<Vec<DiscoveryInstance>> {
+            self.inner.list(query).await
+        }
+
+        async fn list_and_watch(
+            &self,
+            query: DiscoveryQuery,
+            cancel: Option<CancellationToken>,
+        ) -> anyhow::Result<dynamo_runtime::discovery::DiscoveryStream> {
+            self.inner.list_and_watch(query, cancel).await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_registration_releases_shutdown_lock_and_withdraws_ambiguous_publication() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (cancel, publish_before_stall) in [(true, false), (true, true), (false, true)] {
+                let runtime = Runtime::from_current().unwrap();
+                let drt =
+                    DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+                        .await
+                        .unwrap();
+                let endpoint = drt
+                    .namespace("stalled_registration")
+                    .unwrap()
+                    .component("backend")
+                    .unwrap()
+                    .endpoint("generate");
+                let started = endpoint
+                    .endpoint_builder()
+                    .handler(Ingress::<SingleIn<String>, ManyOut<Annotated<String>>>::new())
+                    .start_without_registration()
+                    .await
+                    .unwrap();
+                let discovery = Arc::new(StalledDiscovery {
+                    inner: drt.discovery(),
+                    publish_before_stall,
+                    entered: Notify::new(),
+                    release: Notify::new(),
+                    dropped: Notify::new(),
+                    completed: AtomicUsize::new(0),
+                });
+                let mut membership = EndpointMembership::new(
+                    endpoint.clone(),
+                    started.instance(),
+                    if cancel {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_millis(20)
+                    },
+                );
+                membership.discovery = discovery.clone();
+                let (states, receiver) = watch::channel(Some(EngineServingState {
+                    instance_id: 1,
+                    revision: 1,
+                    ready: true,
+                    observation_epoch: 1,
+                    weight_version: Some("1".into()),
+                }));
+                let mutation = Arc::new(Mutex::new(()));
+                let shutdown = CancellationToken::new();
+                let task = tokio::spawn(follow_engine_state(
+                    membership,
+                    receiver,
+                    mutation.clone(),
+                    shutdown.clone(),
+                    ReadinessHold::take(drt.system_health(), endpoint.name()),
+                    None,
+                ));
+                discovery.entered.notified().await;
+                assert!(mutation.try_lock().is_err());
+                assert_eq!(count(&endpoint).await, usize::from(publish_before_stall));
+                if cancel {
+                    shutdown.cancel();
+                }
+                discovery.dropped.notified().await;
+                if !cancel {
+                    assert!(!drt.system_health().lock().get_health_status().0);
+                    shutdown.cancel();
+                }
+                let guard = mutation.lock().await;
+                endpoint.unregister_endpoint_instance().await.unwrap();
+                drop(guard);
+                task.await.unwrap();
+                // Releasing the peer and sending a fresh observation must not
+                // resume a detached local registration after final withdrawal.
+                discovery.release.notify_one();
+                states.send_modify(|state| state.as_mut().unwrap().revision += 1);
+                tokio::task::yield_now().await;
+                assert_eq!(discovery.completed.load(Ordering::SeqCst), 0);
+                assert_eq!(count(&endpoint).await, 0);
+                started.shutdown().await.unwrap();
+                runtime.shutdown();
+            }
+        })
+        .await
+        .expect("stalled discovery must not block shutdown");
+    }
 
     async fn count(endpoint: &Endpoint) -> usize {
         let id = endpoint.id();
@@ -187,7 +396,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mutation = Arc::new(Mutex::new(()));
         let task = tokio::spawn(follow_engine_state(
-            endpoint.clone(),
+            EndpointMembership::new(endpoint.clone(), started.instance(), Duration::from_secs(1)),
             rx,
             mutation.clone(),
             shutdown.clone(),
@@ -292,7 +501,7 @@ mod tests {
         }));
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(follow_engine_state(
-            endpoint.clone(),
+            EndpointMembership::new(endpoint.clone(), started.instance(), Duration::from_secs(1)),
             rx,
             Arc::new(Mutex::new(())),
             shutdown.clone(),
